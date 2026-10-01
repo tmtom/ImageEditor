@@ -24,6 +24,7 @@ from PySide6.QtGui import (
     QCursor,
     QDesktopServices,
     QIcon,
+    QImage,
     QImageIOHandler,
     QImageWriter,
     QKeySequence,
@@ -72,10 +73,12 @@ from PySide6.QtCore import Signal as pyqtSignal
 
 try:
     from .CameraDialog import CameraDialog
+    from .CameraGPhotoDialog import CameraGPhotoDialog
     from .UndoStack import UndoStack
     from .image_tools import *
 except ImportError:
     from CameraDialog import CameraDialog
+    from CameraGPhotoDialog import CameraGPhotoDialog
     from UndoStack import UndoStack
     from image_tools import *
 try:
@@ -1152,7 +1155,7 @@ class SettingsDialog(QDialog):
 class ImageEditorDialog(QDialog):
     imageSaved = pyqtSignal(QImage)
 
-    def __init__(self, parent=None, scrollpanel=False, readonly=False):
+    def __init__(self, parent=None, scrollpanel=False, readonly=False, camera_manager=None):
         super().__init__(parent, Qt.WindowSystemMenuHint |
                          Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
 
@@ -1203,6 +1206,9 @@ class ImageEditorDialog(QDialog):
 
         self.has_scrollpanel = scrollpanel
         self.readonly = readonly
+        # Host applications may share an explicitly owned manager across editor
+        # instances; standalone use falls back to the process default manager.
+        self.camera_manager = camera_manager
         self.name = ''
         self.isChanged = False
         self.cropDlg = None
@@ -1270,6 +1276,8 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct = QAction(self.tr("Cut right half"), self, triggered=self.cutRight)
         if self.use_webcam:
             self.cameraAct = QAction(QIcon(':/webcam.png'), self.tr("Camera"), self, triggered=self.camera)
+        self.cameraGPhotoAct = QAction(QIcon(':/webcam.png'), self.tr("Camera (libgphoto2)"), self,
+                                       triggered=self.cameraGPhoto)
         self.prevImageAct = QAction(QIcon(':/arrow_left.png'), self.tr("Previous image"), self, shortcut=QKeySequence.MoveToPreviousWord, triggered=self.prevImage)
         self.nextImageAct = QAction(QIcon(':/arrow_right.png'), self.tr("Next image"), self, shortcut=QKeySequence.MoveToNextWord, triggered=self.nextImage)
         self.prevRecordAct = QAction(QIcon(':/arrow_up.png'), self.tr("Previous record"), self, shortcut=Qt.CTRL | Qt.Key_Up, triggered=self.prevRecord)
@@ -1320,6 +1328,7 @@ class ImageEditorDialog(QDialog):
         self.editMenu.addSeparator()
         if self.use_webcam:
             self.editMenu.addAction(self.cameraAct)
+        self.editMenu.addAction(self.cameraGPhotoAct)
 
         self.navigationMenu = QMenu(self.tr("Navigation"), self)
         self.navigationMenu.addAction(self.prevImageAct)
@@ -1367,6 +1376,7 @@ class ImageEditorDialog(QDialog):
         self.toolBar.addSeparator()
         if self.use_webcam:
             self.toolBar.addAction(self.cameraAct)
+        self.toolBar.addAction(self.cameraGPhotoAct)
 
     def setTitle(self, title=None, subtitle=None):
         competed_title_parts = []
@@ -2121,6 +2131,7 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct.setEnabled(enabled and not self.readonly)
         if self.use_webcam:
             self.cameraAct.setEnabled(enabled and not self.readonly)
+        self.cameraGPhotoAct.setEnabled(enabled and not self.readonly)
 
     def _updateEditActions(self):
         inCrop = self.cropAct.isChecked()
@@ -2141,6 +2152,7 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct.setDisabled(inCrop or inRotate)
         if self.use_webcam:
             self.cameraAct.setDisabled(inCrop or inRotate)
+        self.cameraGPhotoAct.setDisabled(inCrop or inRotate)
         self.prevImageAct.setDisabled(inCrop or inRotate)
         self.nextImageAct.setDisabled(inCrop or inRotate)
         self.prevRecordAct.setDisabled(inCrop or inRotate)
@@ -2235,6 +2247,19 @@ class ImageEditorDialog(QDialog):
 
     def camera(self):
         dlg = CameraDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            image = dlg.image
+            if image:
+                pixmap = self._pixmapHandle.pixmap()
+                self.pushUndo(pixmap)
+                self.setImage(image)
+                self.isChanged = True
+                self.markWindowTitle(self.isChanged)
+                self._updateEditActions()
+        dlg.deleteLater()
+
+    def cameraGPhoto(self):
+        dlg = CameraGPhotoDialog(self, self.camera_manager)
         if dlg.exec() == QDialog.Accepted:
             image = dlg.image
             if image:
