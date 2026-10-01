@@ -1270,6 +1270,7 @@ class ImageEditorDialog(QDialog):
         self.isFitToWindow = True
         self.undo_stack = UndoStack()
         self.use_webcam = settings.value('mainwindow/use_webcam', True, type=bool)
+        self.use_camera = settings.value('mainwindow/use_camera', True, type=bool)
         self.proxy = None
 
         self.createActions()
@@ -1322,11 +1323,10 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct = QAction(self.tr("Cut right half"), self, triggered=self.cutRight)
         if self.use_webcam:
             self.cameraAct = QAction(QIcon(':/webcam.png'), self.tr("Camera"), self, triggered=self.camera)
-        self.cameraGPhotoAct = QAction(QIcon(':/camera.png'), self.tr("Camera (libgphoto2)"), self,
-                                       triggered=self.cameraGPhoto)
-        self.gphotoCaptureShortcut = QShortcut(
-            QKeySequence("Shift+K"), self, self.captureGPhoto
-        )
+        if self.use_camera:
+            self.cameraGPhotoAct = QAction(QIcon(':/camera.png'), self.tr("Camera (libgphoto2)"), self,
+                                           triggered=self.cameraGPhoto)
+            self.gphotoCaptureShortcut = QShortcut(QKeySequence("Shift+K"), self, self.captureGPhoto)
         self.prevImageAct = QAction(QIcon(':/arrow_left.png'), self.tr("Previous image"), self, shortcut=QKeySequence.MoveToPreviousWord, triggered=self.prevImage)
         self.nextImageAct = QAction(QIcon(':/arrow_right.png'), self.tr("Next image"), self, shortcut=QKeySequence.MoveToNextWord, triggered=self.nextImage)
         self.prevRecordAct = QAction(QIcon(':/arrow_up.png'), self.tr("Previous record"), self, shortcut=Qt.CTRL | Qt.Key_Up, triggered=self.prevRecord)
@@ -1377,7 +1377,8 @@ class ImageEditorDialog(QDialog):
         self.editMenu.addSeparator()
         if self.use_webcam:
             self.editMenu.addAction(self.cameraAct)
-        self.editMenu.addAction(self.cameraGPhotoAct)
+        if self.use_camera:
+            self.editMenu.addAction(self.cameraGPhotoAct)
 
         self.navigationMenu = QMenu(self.tr("Navigation"), self)
         self.navigationMenu.addAction(self.prevImageAct)
@@ -1425,7 +1426,8 @@ class ImageEditorDialog(QDialog):
         self.toolBar.addSeparator()
         if self.use_webcam:
             self.toolBar.addAction(self.cameraAct)
-        self.toolBar.addAction(self.cameraGPhotoAct)
+        if self.use_camera:
+            self.toolBar.addAction(self.cameraGPhotoAct)
 
     def setTitle(self, title=None, subtitle=None):
         competed_title_parts = []
@@ -2180,9 +2182,10 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct.setEnabled(enabled and not self.readonly)
         if self.use_webcam:
             self.cameraAct.setEnabled(enabled and not self.readonly)
-        self.cameraGPhotoAct.setEnabled(
-            enabled and not self.readonly and not self._gphoto_capture_pending
-        )
+        if self.use_camera:
+            self.cameraGPhotoAct.setEnabled(
+                enabled and not self.readonly and not self._gphoto_capture_pending
+            )
 
     def _updateEditActions(self):
         inCrop = self.cropAct.isChecked()
@@ -2203,9 +2206,10 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct.setDisabled(inCrop or inRotate)
         if self.use_webcam:
             self.cameraAct.setDisabled(inCrop or inRotate)
-        self.cameraGPhotoAct.setDisabled(
-            inCrop or inRotate or self._gphoto_capture_pending
-        )
+        if self.use_camera:
+            self.cameraGPhotoAct.setDisabled(
+                inCrop or inRotate or self._gphoto_capture_pending
+            )
         self.prevImageAct.setDisabled(inCrop or inRotate)
         self.nextImageAct.setDisabled(inCrop or inRotate)
         self.prevRecordAct.setDisabled(inCrop or inRotate)
@@ -2312,7 +2316,7 @@ class ImageEditorDialog(QDialog):
         dlg.deleteLater()
 
     def cameraGPhoto(self):
-        if self._gphoto_capture_pending:
+        if not self.use_camera or self._gphoto_capture_pending:
             return
         dlg = CameraGPhotoDialog(self, self.camera_manager)
         if dlg.exec() == QDialog.Accepted:
@@ -2329,7 +2333,8 @@ class ImageEditorDialog(QDialog):
     def captureGPhoto(self) -> None:
         """Start a background capture using the last camera and saved settings."""
         if (
-            self._gphoto_capture_pending
+            not self.use_camera
+            or self._gphoto_capture_pending
             or self.readonly
             or self.cropAct.isChecked()
             or self.rotateAct.isChecked()
