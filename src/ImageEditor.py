@@ -1322,7 +1322,7 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct = QAction(self.tr("Cut right half"), self, triggered=self.cutRight)
         if self.use_webcam:
             self.cameraAct = QAction(QIcon(':/webcam.png'), self.tr("Camera"), self, triggered=self.camera)
-        self.cameraGPhotoAct = QAction(QIcon(':/webcam.png'), self.tr("Camera (libgphoto2)"), self,
+        self.cameraGPhotoAct = QAction(QIcon(':/camera.png'), self.tr("Camera (libgphoto2)"), self,
                                        triggered=self.cameraGPhoto)
         self.gphotoCaptureShortcut = QShortcut(
             QKeySequence("Shift+K"), self, self.captureGPhoto

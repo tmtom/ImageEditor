@@ -130,7 +130,7 @@ class CameraGPhotoDialog(QDialog):
                 manager is used when omitted.
         """
         super().__init__(parent)
-        self.setWindowIcon(QIcon(":/webcam.png"))
+        self.setWindowIcon(QIcon(":/camera.png"))
         self.setWindowTitle(self.tr("Camera (libgphoto2)"))
         self.resize(440, 520)
 
