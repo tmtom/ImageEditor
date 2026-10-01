@@ -1,4 +1,5 @@
 import os
+from typing import Any, Dict, Optional
 
 from PySide6.QtCore import (
     QBuffer,
@@ -10,11 +11,13 @@ from PySide6.QtCore import (
     QMargins,
     QMimeData,
     QObject,
+    QRunnable,
     QRect,
     QSettings,
     QStandardPaths,
     QTemporaryFile,
     QTimer,
+    QThreadPool,
     QUrl,
 )
 from PySide6.QtGui import (
@@ -74,11 +77,13 @@ from PySide6.QtCore import Signal as pyqtSignal
 try:
     from .CameraDialog import CameraDialog
     from .CameraGPhotoDialog import CameraGPhotoDialog
+    from .LibGPhotoCamera import get_default_camera_manager
     from .UndoStack import UndoStack
     from .image_tools import *
 except ImportError:
     from CameraDialog import CameraDialog
     from CameraGPhotoDialog import CameraGPhotoDialog
+    from LibGPhotoCamera import get_default_camera_manager
     from UndoStack import UndoStack
     from image_tools import *
 try:
@@ -107,6 +112,44 @@ ZOOM_LIST = (600, 480, 385, 310, 250, 200, 158, 125,
 ZOOM_MAX = ZOOM_LIST[0]
 ZOOM_MIN = ZOOM_LIST[-1]
 MASK_OPACITY = 0.3
+
+
+class _DirectCaptureSignals(QObject):
+    """Deliver direct-camera capture results safely to the GUI thread."""
+
+    finished = pyqtSignal(object, object)
+
+
+class _DirectCameraCaptureTask(QRunnable):
+    """Run one libgphoto2 capture away from the GUI thread."""
+
+    def __init__(
+        self,
+        manager: Any,
+        selected: Dict[str, str],
+        preferences: Dict[str, Any],
+        signals: _DirectCaptureSignals,
+    ) -> None:
+        """Store the camera request and result signal for the worker run."""
+        super().__init__()
+        self.manager = manager
+        self.selected = selected
+        self.preferences = preferences
+        self.signals = signals
+
+    def run(self) -> None:
+        """Capture with the saved options and emit bytes or an error message."""
+        try:
+            image_data = self.manager.capture(
+                self.selected,
+                self.preferences.get("settings", {}),
+                preview=self.preferences.get("preview", False),
+                restore_target=self.preferences.get("restore_target", True),
+            )
+        except Exception as error:
+            self.signals.finished.emit(None, str(error))
+        else:
+            self.signals.finished.emit(image_data, None)
 
 
 @storeDlgPositionDecorator
@@ -1209,6 +1252,9 @@ class ImageEditorDialog(QDialog):
         # Host applications may share an explicitly owned manager across editor
         # instances; standalone use falls back to the process default manager.
         self.camera_manager = camera_manager
+        self._gphoto_capture_pending = False
+        self._direct_capture_signals = _DirectCaptureSignals(QApplication.instance())
+        self._direct_capture_signals.finished.connect(self._directCaptureFinished)
         self.name = ''
         self.isChanged = False
         self.cropDlg = None
@@ -1278,6 +1324,9 @@ class ImageEditorDialog(QDialog):
             self.cameraAct = QAction(QIcon(':/webcam.png'), self.tr("Camera"), self, triggered=self.camera)
         self.cameraGPhotoAct = QAction(QIcon(':/webcam.png'), self.tr("Camera (libgphoto2)"), self,
                                        triggered=self.cameraGPhoto)
+        self.gphotoCaptureShortcut = QShortcut(
+            QKeySequence("Shift+K"), self, self.captureGPhoto
+        )
         self.prevImageAct = QAction(QIcon(':/arrow_left.png'), self.tr("Previous image"), self, shortcut=QKeySequence.MoveToPreviousWord, triggered=self.prevImage)
         self.nextImageAct = QAction(QIcon(':/arrow_right.png'), self.tr("Next image"), self, shortcut=QKeySequence.MoveToNextWord, triggered=self.nextImage)
         self.prevRecordAct = QAction(QIcon(':/arrow_up.png'), self.tr("Previous record"), self, shortcut=Qt.CTRL | Qt.Key_Up, triggered=self.prevRecord)
@@ -2131,7 +2180,9 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct.setEnabled(enabled and not self.readonly)
         if self.use_webcam:
             self.cameraAct.setEnabled(enabled and not self.readonly)
-        self.cameraGPhotoAct.setEnabled(enabled and not self.readonly)
+        self.cameraGPhotoAct.setEnabled(
+            enabled and not self.readonly and not self._gphoto_capture_pending
+        )
 
     def _updateEditActions(self):
         inCrop = self.cropAct.isChecked()
@@ -2152,7 +2203,9 @@ class ImageEditorDialog(QDialog):
         self.cutRightAct.setDisabled(inCrop or inRotate)
         if self.use_webcam:
             self.cameraAct.setDisabled(inCrop or inRotate)
-        self.cameraGPhotoAct.setDisabled(inCrop or inRotate)
+        self.cameraGPhotoAct.setDisabled(
+            inCrop or inRotate or self._gphoto_capture_pending
+        )
         self.prevImageAct.setDisabled(inCrop or inRotate)
         self.nextImageAct.setDisabled(inCrop or inRotate)
         self.prevRecordAct.setDisabled(inCrop or inRotate)
@@ -2259,6 +2312,8 @@ class ImageEditorDialog(QDialog):
         dlg.deleteLater()
 
     def cameraGPhoto(self):
+        if self._gphoto_capture_pending:
+            return
         dlg = CameraGPhotoDialog(self, self.camera_manager)
         if dlg.exec() == QDialog.Accepted:
             image = dlg.image
@@ -2270,6 +2325,65 @@ class ImageEditorDialog(QDialog):
                 self.markWindowTitle(self.isChanged)
                 self._updateEditActions()
         dlg.deleteLater()
+
+    def captureGPhoto(self) -> None:
+        """Start a background capture using the last camera and saved settings."""
+        if (
+            self._gphoto_capture_pending
+            or self.readonly
+            or self.cropAct.isChecked()
+            or self.rotateAct.isChecked()
+        ):
+            return
+
+        manager = self.camera_manager or get_default_camera_manager()
+        selected = manager.last_camera
+        if selected is None:
+            QMessageBox.warning(
+                self,
+                self.tr("Camera Error"),
+                self.tr(
+                    "No libgphoto2 camera is configured. Open Camera (libgphoto2) to configure one."
+                ),
+            )
+            return
+
+        preferences = manager.preferences(selected)
+        self._gphoto_capture_pending = True
+        self.cameraGPhotoAct.setEnabled(False)
+        self.statusBar.showMessage(self.tr("Capturing image..."))
+        task = _DirectCameraCaptureTask(
+            manager, selected, preferences, self._direct_capture_signals
+        )
+        QThreadPool.globalInstance().start(task)
+
+    def _directCaptureFinished(
+        self, image_data: Optional[bytes], error_message: Optional[str]
+    ) -> None:
+        """Handle the background capture result on the GUI thread."""
+        self._gphoto_capture_pending = False
+        self.statusBar.clearMessage()
+        self._updateActions()
+        self._updateEditActions()
+
+        if error_message is not None:
+            QMessageBox.warning(self, self.tr("Camera Error"), error_message)
+            return
+
+        image = QImage.fromData(image_data or b"")
+        if image.isNull():
+            QMessageBox.warning(
+                self,
+                self.tr("Camera Error"),
+                self.tr("Captured data is not a supported image."),
+            )
+            return
+        if self.hasImage():
+            self.pushUndo(self._pixmapHandle.pixmap())
+        self.setImage(image)
+        self.isChanged = True
+        self.markWindowTitle(self.isChanged)
+        self._updateEditActions()
 
     def rembg(self):
         if PORTABLE:
