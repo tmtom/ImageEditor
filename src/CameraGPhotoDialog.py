@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import (
     QCoreApplication,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 try:
     from .LibGPhotoCamera import (
+        ConfigItem,
         GP_WIDGET_BUTTON,
         GP_WIDGET_DATE,
         GP_WIDGET_MENU,
@@ -36,10 +37,13 @@ try:
         GP_WIDGET_RANGE,
         GP_WIDGET_TEXT,
         GP_WIDGET_TOGGLE,
+        LibGPhotoCameraManager,
+        Value,
         get_default_camera_manager,
     )
 except ImportError:
     from LibGPhotoCamera import (
+        ConfigItem,
         GP_WIDGET_BUTTON,
         GP_WIDGET_DATE,
         GP_WIDGET_MENU,
@@ -47,6 +51,8 @@ except ImportError:
         GP_WIDGET_RANGE,
         GP_WIDGET_TEXT,
         GP_WIDGET_TOGGLE,
+        LibGPhotoCameraManager,
+        Value,
         get_default_camera_manager,
     )
 
@@ -69,6 +75,9 @@ HIDDEN_CAMERA_SETTING_LABELS = frozenset({
 class _CameraCaptureSignals(QObject):
     """Deliver camera capture results to the dialog's GUI thread."""
 
+    # Emitted from the QThreadPool worker; the receiver lives on the GUI
+    # thread, so Qt turns this into a queued connection and the slot runs
+    # on the GUI thread. Payloads are (image bytes | None, error | None).
     finished = pyqtSignal(object, object)
 
 
@@ -77,9 +86,9 @@ class _CameraCaptureTask(QRunnable):
 
     def __init__(
         self,
-        camera_manager: Any,
+        camera_manager: LibGPhotoCameraManager,
         selected: Dict[str, str],
-        settings: Dict[str, Any],
+        settings: Dict[str, Value],
         preview: bool,
         restore_target: bool,
         signals: _CameraCaptureSignals,
@@ -119,8 +128,11 @@ class _CameraCaptureTask(QRunnable):
 class CameraGPhotoDialog(QDialog):
     """Dialog for choosing a libgphoto2 camera, configuring it, and capturing."""
 
+    image: Optional[QImage]
+    camera: LibGPhotoCameraManager
+
     def __init__(
-        self, parent: Optional[QWidget] = None, camera_manager: Optional[Any] = None
+        self, parent: Optional[QWidget] = None, camera_manager: Optional[LibGPhotoCameraManager] = None
     ) -> None:
         """Build the camera UI and initialize camera discovery.
 
@@ -136,6 +148,9 @@ class CameraGPhotoDialog(QDialog):
 
         self.camera = camera_manager or get_default_camera_manager()
         app = QApplication.instance()
+        # Hook manager cleanup (restore changed camera settings, sync
+        # QSettings) to application shutdown exactly once per manager, even
+        # when several dialogs are opened during the process lifetime.
         if app is not None and not getattr(self.camera, "_qt_shutdown_connected", False):
             app.aboutToQuit.connect(self.camera.close)
             self.camera._qt_shutdown_connected = True
@@ -197,6 +212,7 @@ class CameraGPhotoDialog(QDialog):
         except (OSError, RuntimeError, AttributeError) as error:
             self.cameraSelector.setEnabled(False)
             self.previewCheckbox.setEnabled(False)
+            self.restoreTargetCheckbox.setEnabled(False)
             self.statusLabel.setText(self.tr("Could not initialize libgphoto2."))
             QMessageBox.warning(self, self.tr("Camera Error"), str(error))
             return
@@ -221,6 +237,11 @@ class CameraGPhotoDialog(QDialog):
                 if self.camera.camera_key(camera) == self.camera.camera_key(last_camera):
                     selected_index = index
                     break
+        # addItem() already moved the empty combo to index 0, so
+        # setCurrentIndex() only emits currentIndexChanged when the target
+        # index differs; call the handler explicitly to cover the no-change
+        # case. When the signal does fire, the handler runs twice - the
+        # second pass is cheap because the manager caches the inspection.
         self.cameraSelector.setCurrentIndex(selected_index)
         self.cameraSelectionChanged(selected_index)
 
@@ -260,12 +281,25 @@ class CameraGPhotoDialog(QDialog):
             info = self.camera.inspect(selected)
         except (OSError, RuntimeError, AttributeError) as error:
             self._clear_controls()
+            # Forget the unreachable camera and the previous camera's
+            # capabilities: a stray _configChanged must not save empty
+            # values over this camera's stored preferences or judge
+            # capture availability from stale state.
+            self._selected = None
+            self._parameters = []
+            self._cached_config = False
+            self._preview_available = False
+            self._standard_capture_available = False
             self.previewCheckbox.setEnabled(False)
+            self.restoreTargetCheckbox.setEnabled(False)
             self.statusLabel.setText(self.tr("Could not read camera settings."))
             QMessageBox.warning(self, self.tr("Camera Error"), str(error))
             return
 
         self._parameters = info["parameters"]
+        # The manager marks results served from the persisted schema cache
+        # (camera currently unreachable) with "_cached"; capture stays
+        # disabled in that case.
         self._cached_config = info.pop("_cached", False)
         preferences = self.camera.preferences(selected)
         remembered = preferences.get("settings", {})
@@ -281,6 +315,8 @@ class CameraGPhotoDialog(QDialog):
         self._preview_available = preview_available
         self._standard_capture_available = info["capture"]
         self.previewCheckbox.setEnabled(preview_available)
+        # Re-enable after a previous camera's settings failed to load.
+        self.restoreTargetCheckbox.setEnabled(True)
         self.previewCheckbox.blockSignals(True)
         preview_default = bool(preferences.get("preview", preview_available)) and preview_available
         if preview_available and not self._standard_capture_available:
@@ -339,7 +375,7 @@ class CameraGPhotoDialog(QDialog):
                 self.tr("Standard capture is unavailable unless an internal-RAM target is selected.")
             )
 
-    def _configChanged(self, *_args: Any) -> None:
+    def _configChanged(self, *_args: object) -> None:
         """Persist changed controls and recalculate capture availability."""
         if self._changing_camera:
             return
@@ -354,8 +390,8 @@ class CameraGPhotoDialog(QDialog):
 
     def _build_controls(
         self,
-        parameters: List[Dict[str, Any]],
-        remembered: Dict[str, Any],
+        parameters: List[ConfigItem],
+        remembered: Dict[str, Value],
     ) -> None:
         """Create controls for supported settings, using remembered values."""
         self._changing_camera = True
@@ -369,6 +405,9 @@ class CameraGPhotoDialog(QDialog):
                 continue
             path = parameter["path"]
             value = remembered.get(path, parameter["value"])
+            # First-use defaults when nothing is remembered for this camera:
+            # prefer the full-size image and an internal-RAM capture target
+            # so standard capture is immediately available and safe.
             if path.endswith("/capturesizeclass") and path not in remembered:
                 full_image = next(
                     (choice for choice in parameter["choices"]
@@ -406,19 +445,23 @@ class CameraGPhotoDialog(QDialog):
         self._changing_camera = False
 
     @staticmethod
-    def _is_ram_choice(choice: str) -> bool:
-        """Recognize an internal-memory target while rejecting card targets."""
-        normalized = choice.lower().strip()
+    def _is_ram_choice(choice: Value) -> bool:
+        """Recognize an internal-memory target while rejecting card targets.
+
+        Mirrors ``LibGPhotoCamera._is_ram``; tolerates any widget value,
+        including ``None`` from a failed read.
+        """
+        normalized = str(choice).lower().strip()
         return "card" not in normalized and any(word in normalized for word in ("ram", "sdram", "internal"))
 
     @staticmethod
-    def _normalize_camera_text(text: Any) -> str:
+    def _normalize_camera_text(text: str) -> str:
         """Normalize a setting label for comparison with the hidden-label list."""
-        return "".join(character for character in str(text).casefold() if character.isalnum())
+        return "".join(character for character in text.casefold() if character.isalnum())
 
     @classmethod
     def _is_hidden_parameter(
-        cls: type, parameter: Dict[str, Any]
+        cls: type, parameter: ConfigItem
     ) -> bool:
         """Return whether a config parameter is intentionally hidden."""
         return cls._normalize_camera_text(parameter.get("label", "")) in HIDDEN_CAMERA_SETTING_LABELS
@@ -439,7 +482,7 @@ class CameraGPhotoDialog(QDialog):
         return translated
 
     def _make_control(
-        self, parameter: Dict[str, Any], value: Any
+        self, parameter: ConfigItem, value: Value
     ) -> Optional[QWidget]:
         """Build the Qt editor matching a libgphoto2 widget type."""
         kind = parameter["type"]
@@ -462,7 +505,9 @@ class CameraGPhotoDialog(QDialog):
             edit = QLineEdit("" if value is None else str(value))
             return edit
         if kind == GP_WIDGET_RANGE:
-            low, high, step = parameter.get("range", (0.0, 100.0, 1.0))
+            # `or` also covers a None range (bounds unreadable) and older
+            # persisted caches that omit the key entirely.
+            low, high, step = parameter.get("range") or (0.0, 100.0, 1.0)
             spin = QDoubleSpinBox()
             spin.setRange(low, high)
             spin.setSingleStep(step if step > 0 else 1.0)
@@ -496,6 +541,8 @@ class CameraGPhotoDialog(QDialog):
         if self._selected is None or self._capture_pending:
             return
         self._save_current_values()
+        # Read the values back from the manager so the worker thread gets a
+        # deep copy fully detached from the GUI widgets.
         settings = self.camera.preferences(self._selected).get("settings", {})
         preview = self.previewCheckbox.isChecked() and self.previewCheckbox.isEnabled()
         restore_target = self.restoreTargetCheckbox.isChecked()
@@ -599,5 +646,8 @@ class CameraGPhotoDialog(QDialog):
             i for i, camera in enumerate(cameras)
             if last and self.camera.camera_key(camera) == self.camera.camera_key(last)
         ), 0)
+        # Same explicit-call pattern as initializeCameras(): setCurrentIndex
+        # is silent when the index does not change (the combo already sits
+        # at index 0 after repopulation).
         self.cameraSelector.setCurrentIndex(index)
         self.cameraSelectionChanged(index)

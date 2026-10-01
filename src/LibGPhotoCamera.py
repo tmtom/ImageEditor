@@ -7,7 +7,10 @@ import json
 import os
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypedDict, Union
+
+if TYPE_CHECKING:
+    from PySide6.QtCore import QSettings
 
 
 GP_WIDGET_WINDOW = 0
@@ -23,8 +26,60 @@ GP_OPERATION_CAPTURE_IMAGE = 1
 GP_OPERATION_CAPTURE_PREVIEW = 8
 GP_FILE_TYPE_NORMAL = 0
 
+# Handles returned by os.add_dll_directory() must stay referenced for as long
+# as the DLL search path is needed; garbage-collecting one removes its
+# directory and can break lazy loading of libgphoto2 plugin dependencies.
 _dll_directory_handles = []
 _msvcrt_runtime = None
+
+
+# Opaque handle held by or returned from libgphoto2's C API. Functions whose
+# ``restype`` is ``c_void_p`` return ``int`` (or ``None`` for NULL), while
+# handles allocated locally are ``ctypes.c_void_p`` instances.
+Handle = Union[int, ctypes.c_void_p]
+
+# A single camera-setting value as read from or written to a config widget.
+Value = Union[int, float, str, None]
+
+
+class ConfigItem(TypedDict):
+    """Metadata describing one flattened camera-configuration setting.
+
+    ``range`` is ``None`` unless the item is a GP_WIDGET_RANGE whose bounds
+    were readable, and ``value`` is ``None`` when libgphoto2 could not read
+    the widget. Items persisted through QSettings make a JSON round trip,
+    after which ``range`` arrives as a list instead of a tuple.
+    """
+
+    path: str
+    name: str
+    label: str
+    type: int
+    value: Value
+    choices: List[str]
+    readonly: bool
+    range: Optional[Tuple[float, float, float]]
+
+
+class Preferences(TypedDict, total=False):
+    """Persisted per-camera capture settings.
+
+    All keys are optional: ``save_preferences`` stores the full set, but a
+    camera without saved preferences returns an empty dict, so readers must
+    use ``.get(...)`` with defaults.
+    """
+
+    settings: Dict[str, Value]
+    preview: bool
+    restore_target: bool
+
+
+class InspectResult(TypedDict):
+    """Result of a live camera-configuration inspection."""
+
+    parameters: List[ConfigItem]
+    preview: bool
+    capture: bool
 
 
 class CameraAbilities(ctypes.Structure):
@@ -89,7 +144,7 @@ def _set_msys2_environment(name: str, value: str) -> None:
         raise OSError(f"Could not set {name} for the MSYS2 runtime")
 
 
-def _load_libraries() -> Tuple[Any, Any]:
+def _load_libraries() -> Tuple[ctypes.CDLL, ctypes.CDLL]:
     """Load libgphoto2 and its port library for the current platform."""
     if sys.platform.startswith("win"):
         msys2_bin, camlibs, iolibs = _msys2_paths()
@@ -117,7 +172,7 @@ def _load_libraries() -> Tuple[Any, Any]:
     raise OSError(f"Unsupported operating system: {sys.platform}")
 
 
-def _configure_api(gp: Any, port: Any) -> None:
+def _configure_api(gp: ctypes.CDLL, port: ctypes.CDLL) -> None:
     """Declare ctypes argument and return types for used C functions."""
     p = ctypes.c_void_p
     i = ctypes.c_int
@@ -190,6 +245,9 @@ def _decode(value: Optional[bytes]) -> str:
 class LibGPhotoCamera:
     """Own the libgphoto2 libraries and perform camera/config/capture operations."""
 
+    gp: ctypes.CDLL
+    portlib: ctypes.CDLL
+
     def __init__(self) -> None:
         """Load libgphoto2 and prepare the ctypes API bindings."""
         self.gp, self.portlib = _load_libraries()
@@ -227,7 +285,7 @@ class LibGPhotoCamera:
                 gp.gp_list_free(camera_list)
             gp.gp_context_unref(context)
 
-    def _close(self, opened: Tuple[Any, Any, int, Any, Any]) -> None:
+    def _close(self, opened: Tuple[Handle, Handle, int, Handle, Handle]) -> None:
         """Release all libgphoto2 resources associated with an open camera."""
         context, camera, _operations, port_list, abilities_list = opened
         gp = self.gp
@@ -237,7 +295,7 @@ class LibGPhotoCamera:
         gp.gp_abilities_list_free(abilities_list)
         gp.gp_context_unref(context)
 
-    def _get_config(self, camera: Any, context: Any) -> Any:
+    def _get_config(self, camera: Handle, context: Handle) -> Handle:
         """Fetch the camera's live configuration tree."""
         config = ctypes.c_void_p()
         result = self.gp.gp_camera_get_config(camera, ctypes.byref(config), context)
@@ -247,7 +305,7 @@ class LibGPhotoCamera:
             raise self._error(result, "Could not read camera settings")
         return config
 
-    def _read_value(self, widget: Any, widget_type: int) -> Any:
+    def _read_value(self, widget: Handle, widget_type: int) -> Value:
         """Read a widget value using the C type required by its widget kind."""
         if widget_type in (GP_WIDGET_TOGGLE, GP_WIDGET_DATE):
             value = ctypes.c_int()
@@ -266,8 +324,8 @@ class LibGPhotoCamera:
         return _decode(value.value) if result >= 0 else None
 
     def _config_items(
-        self, widget: Any, prefix: str = ""
-    ) -> List[Dict[str, Any]]:
+        self, widget: Handle, prefix: str = ""
+    ) -> List[ConfigItem]:
         """Flatten a config subtree into path-addressed setting metadata."""
         gp = self.gp
         name = ctypes.c_char_p()
@@ -282,7 +340,7 @@ class LibGPhotoCamera:
         readonly = ctypes.c_int()
         gp.gp_widget_get_readonly(widget, ctypes.byref(readonly))
 
-        items = []
+        items: List[ConfigItem] = []
         if kind not in (GP_WIDGET_WINDOW, GP_WIDGET_SECTION, GP_WIDGET_BUTTON) and path:
             value = self._read_value(widget, kind)
             choices = []
@@ -291,17 +349,18 @@ class LibGPhotoCamera:
                     choice = ctypes.c_char_p()
                     if gp.gp_widget_get_choice(widget, index, ctypes.byref(choice)) >= 0:
                         choices.append(_decode(choice.value))
-            item = {
+            value_range: Optional[Tuple[float, float, float]] = None
+            if kind == GP_WIDGET_RANGE:
+                low, high, step = ctypes.c_float(), ctypes.c_float(), ctypes.c_float()
+                if gp.gp_widget_get_range(widget, ctypes.byref(low), ctypes.byref(high), ctypes.byref(step)) >= 0:
+                    value_range = (low.value, high.value, step.value)
+            items.append({
                 "path": path, "name": own_name,
                 "label": _decode(label.value) or own_name,
                 "type": kind, "value": value, "choices": choices,
                 "readonly": bool(readonly.value),
-            }
-            if kind == GP_WIDGET_RANGE:
-                low, high, step = ctypes.c_float(), ctypes.c_float(), ctypes.c_float()
-                if gp.gp_widget_get_range(widget, ctypes.byref(low), ctypes.byref(high), ctypes.byref(step)) >= 0:
-                    item["range"] = (low.value, high.value, step.value)
-            items.append(item)
+                "range": value_range,
+            })
 
         for index in range(gp.gp_widget_count_children(widget)):
             child = ctypes.c_void_p()
@@ -309,7 +368,7 @@ class LibGPhotoCamera:
                 items.extend(self._config_items(child, path))
         return items
 
-    def inspect(self, selected: Dict[str, str]) -> Dict[str, Any]:
+    def inspect(self, selected: Dict[str, str]) -> InspectResult:
         """Return live config metadata and advertised capture capabilities."""
         opened, config = self._open_and_config(selected)
         try:
@@ -333,8 +392,16 @@ class LibGPhotoCamera:
 
     def _open_and_config(
         self, selected: Dict[str, str]
-    ) -> Tuple[Tuple[Any, Any, int, Any, Any], Any]:
-        """Connect and read live config, re-enumerating once if needed."""
+    ) -> Tuple[Tuple[Handle, Handle, int, Handle, Handle], Handle]:
+        """Connect and read live config, re-enumerating once if needed.
+
+        The stored port for a selection can go stale between discovery and
+        connection (replug, sleep). On failure the cameras are re-detected
+        once and the retry uses an exact model/port match, or the single
+        discovered camera of the same model. ``last_resolved_camera``
+        records the identity that actually connected so the manager can
+        re-key its cached state.
+        """
         candidate = selected
         last_error = None
         for attempt in range(2):
@@ -369,13 +436,13 @@ class LibGPhotoCamera:
         raise last_error or RuntimeError("Could not connect to camera")
 
     @staticmethod
-    def _identity(camera: Dict[str, str]) -> Tuple[str, str]:
+    def _identity(camera: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
         """Return the model/port identity used to match a discovered camera."""
         return camera.get("model"), camera.get("port")
 
     def _open_resources(
         self, selected: Dict[str, str]
-    ) -> Tuple[Any, Any, int, Any, Any]:
+    ) -> Tuple[Handle, Handle, int, Handle, Handle]:
         """Create, configure, and initialize a camera and its C resources."""
         gp, pl = self.gp, self.portlib
         context = gp.gp_context_new()
@@ -439,7 +506,7 @@ class LibGPhotoCamera:
                 gp.gp_context_unref(context)
             raise
 
-    def _find_widget(self, root: Any, path: str) -> Any:
+    def _find_widget(self, root: Handle, path: str) -> Handle:
         """Find a setting widget by its slash-delimited config path."""
         widget = root
         for segment in path.strip("/").split("/"):
@@ -450,8 +517,15 @@ class LibGPhotoCamera:
             widget = child
         return widget
 
-    def _set_value(self, widget: Any, kind: int, value: Any) -> None:
-        """Set a widget using a correctly typed temporary C value."""
+    def _set_value(self, widget: Handle, kind: int, value: Value) -> None:
+        """Set a widget using a correctly typed temporary C value.
+
+        ``None`` is not a settable value: numeric widget kinds raise
+        ``TypeError`` from ``int(None)``/``float(None)`` and string kinds
+        would send the literal text ``"None"`` to the camera. Callers
+        replaying recorded originals must skip values that could not be
+        read back when they were recorded.
+        """
         if kind in (GP_WIDGET_TOGGLE, GP_WIDGET_DATE):
             converted = ctypes.c_int(int(value))
             pointer = ctypes.byref(converted)
@@ -465,7 +539,7 @@ class LibGPhotoCamera:
         if result < 0:
             raise self._error(result, "Could not set camera configuration")
 
-    def _bytes_from_file(self, camera_file: Any) -> bytes:
+    def _bytes_from_file(self, camera_file: Handle) -> bytes:
         """Copy image bytes from a libgphoto2 file object."""
         data, size = ctypes.c_char_p(), ctypes.c_ulong()
         result = self.gp.gp_file_get_data_and_size(camera_file, ctypes.byref(data), ctypes.byref(size))
@@ -476,7 +550,7 @@ class LibGPhotoCamera:
         return ctypes.string_at(data, size.value)
 
     @staticmethod
-    def _is_ram(value: Any) -> bool:
+    def _is_ram(value: Value) -> bool:
         """Return whether a capture-target label denotes internal memory."""
         normalized = str(value).lower().strip()
         return "card" not in normalized and any(token in normalized for token in ("ram", "sdram", "internal"))
@@ -484,7 +558,7 @@ class LibGPhotoCamera:
     def capture(
         self,
         selected: Dict[str, str],
-        settings: Dict[str, Any],
+        settings: Dict[str, Value],
         preview: bool = False,
     ) -> bytes:
         """Apply config values, then return captured image bytes."""
@@ -493,12 +567,19 @@ class LibGPhotoCamera:
     def _capture(
         self,
         selected: Dict[str, str],
-        settings: Dict[str, Any],
+        settings: Dict[str, Value],
         preview: bool,
-        originals: Dict[str, Any],
+        originals: Dict[str, Value],
         restore_target: bool,
     ) -> bytes:
-        """Apply supported settings, enforce RAM safety, and capture an image."""
+        """Apply supported settings, enforce RAM safety, and capture an image.
+
+        Standard (non-preview) captures never write to the camera card: the
+        capture target is forced to internal RAM, the camera must confirm
+        RAM targeting after the configuration push, and the captured file
+        is downloaded and then deleted from the camera. Preview captures
+        skip all of this because they do not touch the camera filesystem.
+        """
         opened, config = self._open_and_config(selected)
         context, camera, operations, *_ = opened
         original_target = None
@@ -524,6 +605,8 @@ class LibGPhotoCamera:
                 item = live.get(path)
                 if item is None or item["readonly"]:
                     continue
+                # The capture target is owned exclusively by the RAM-safety
+                # block below; persisted user settings must not change it.
                 if path == target_path:
                     continue
                 if item["choices"] and str(value) not in item["choices"]:
@@ -536,7 +619,11 @@ class LibGPhotoCamera:
                         continue
                 if value == item["value"]:
                     continue
-                originals.setdefault(path, item["value"])
+                # A None original means the live value could not be read;
+                # recording it would make restore() replay an unsettable
+                # value, so leave this path out of the snapshot.
+                if item["value"] is not None:
+                    originals.setdefault(path, item["value"])
                 widget = self._find_widget(config, path)
                 self._set_value(widget, item["type"], value)
                 changed = True
@@ -551,7 +638,8 @@ class LibGPhotoCamera:
                 if not self._is_ram(target_value):
                     if target_item["readonly"]:
                         raise RuntimeError("Camera capture target is read-only and is not internal RAM; refusing standard capture.")
-                    originals.setdefault(target_path, original_target)
+                    if original_target is not None:
+                        originals.setdefault(target_path, original_target)
                     self._set_value(target_widget, target_item["type"], ram)
                     changed = True
 
@@ -622,15 +710,15 @@ class LibGPhotoCamera:
     def capture_managed(
         self,
         selected: Dict[str, str],
-        settings: Dict[str, Any],
-        originals: Dict[str, Any],
+        settings: Dict[str, Value],
+        originals: Dict[str, Value],
         preview: bool = False,
         restore_target: bool = True,
     ) -> bytes:
         """Capture while recording original values for manager cleanup."""
         return self._capture(selected, settings, preview, originals, restore_target)
 
-    def restore(self, selected: Dict[str, str], values: Dict[str, Any]) -> None:
+    def restore(self, selected: Dict[str, str], values: Dict[str, Value]) -> None:
         """Best-effort apply saved original values to a camera's live config."""
         if not values:
             return
@@ -640,6 +728,10 @@ class LibGPhotoCamera:
             live = {item["path"]: item for item in self._config_items(config)}
             changed = False
             for path, value in values.items():
+                if value is None:
+                    # The original could not be read when it was recorded;
+                    # there is nothing valid to write back.
+                    continue
                 item = live.get(path)
                 if item is None or item["readonly"] or item["value"] == value:
                     continue
@@ -656,7 +748,7 @@ class LibGPhotoCamera:
             self.gp.gp_widget_free(config)
             self._close(opened)
 
-    def _choices(self, widget: Any) -> List[str]:
+    def _choices(self, widget: Handle) -> List[str]:
         """Return the current string choices advertised by a widget."""
         choices = []
         for index in range(self.gp.gp_widget_count_choices(widget)):
@@ -667,11 +759,23 @@ class LibGPhotoCamera:
 
 
 class LibGPhotoCameraManager:
-    """Manage live camera state and persist per-camera config/preferences."""
+    """Manage live camera state and persist per-camera config/preferences.
+
+    Every public method serializes on ``_lock``, which is deliberately held
+    across blocking camera I/O: a background capture and GUI-thread calls
+    (inspect, re-evaluate, save) can share one manager safely, and the
+    non-thread-safe ``LibGPhotoCamera`` is never touched from two threads
+    at once. GUI-thread callers should therefore expect to block while a
+    capture is in progress.
+    """
 
     _SETTINGS_KEY = "libgphoto2/state"
 
-    def __init__(self, camera_api: Optional[Any] = None, settings: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        camera_api: Optional[LibGPhotoCamera] = None,
+        settings: Optional["QSettings"] = None,
+    ) -> None:
         """Create a manager, optionally with test API and settings adapters."""
         self._camera_api = camera_api
         self._settings = settings
@@ -685,7 +789,7 @@ class LibGPhotoCameraManager:
         self._load_persisted_state()
 
     @staticmethod
-    def camera_key(camera: Dict[str, str]) -> Tuple[str, str]:
+    def camera_key(camera: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
         """Return the stable identity tuple for a camera record."""
         return LibGPhotoCamera._identity(camera)
 
@@ -694,13 +798,13 @@ class LibGPhotoCameraManager:
         """Return a copy of the most recently selected camera, if any."""
         return copy.deepcopy(self._selected.get("last"))
 
-    def _api(self) -> Any:
+    def _api(self) -> LibGPhotoCamera:
         """Lazily construct and return the low-level camera API wrapper."""
         if self._camera_api is None:
             self._camera_api = LibGPhotoCamera()
         return self._camera_api
 
-    def _settings_store(self) -> Optional[Any]:
+    def _settings_store(self) -> Optional["QSettings"]:
         """Return the injected or application-default QSettings instance."""
         if self._settings is None:
             try:
@@ -807,15 +911,20 @@ class LibGPhotoCameraManager:
                     return cached
             return copy.deepcopy(self._metadata.get(self.camera_key(selected), {}))
 
-    def preferences(self, selected: Dict[str, str]) -> Dict[str, Any]:
-        """Return a deep copy of preferences saved for a camera."""
+    def preferences(self, selected: Dict[str, str]) -> Preferences:
+        """Return a deep copy of preferences saved for a camera.
+
+        A camera without saved preferences yields an empty dict; because
+        every ``Preferences`` key is optional, callers must read entries
+        via ``.get(...)`` with defaults rather than indexing directly.
+        """
         with self._lock:
             return copy.deepcopy(self._preferences.get(self.camera_key(selected), {}))
 
     def save_preferences(
         self,
         selected: Dict[str, str],
-        settings: Dict[str, Any],
+        settings: Dict[str, Value],
         preview: bool,
         restore_target: bool,
     ) -> None:
@@ -834,7 +943,7 @@ class LibGPhotoCameraManager:
     def capture(
         self,
         selected: Dict[str, str],
-        settings: Dict[str, Any],
+        settings: Dict[str, Value],
         preview: bool = False,
         restore_target: bool = True,
     ) -> bytes:
@@ -858,6 +967,10 @@ class LibGPhotoCameraManager:
                 "preview": bool(preview),
                 "restore_target": bool(restore_target),
             })
+            # _adopt_resolved_camera() may have moved this camera's cached
+            # state to the identity discovered during capture and updated
+            # `selected` in place; re-file the preferences saved above under
+            # that resolved identity so no stale key is left behind.
             resolved_key = self.camera_key(selected)
             if resolved_key != key:
                 self._preferences[resolved_key] = self._preferences.pop(key)
@@ -866,9 +979,9 @@ class LibGPhotoCameraManager:
 
     def _adopt_resolved_camera(
         self,
-        old_key: Tuple[str, str],
+        old_key: Tuple[Optional[str], Optional[str]],
         selected: Dict[str, str],
-        originals: Optional[Dict[str, Any]] = None,
+        originals: Optional[Dict[str, Value]] = None,
     ) -> None:
         """Move cached state to a camera identity resolved after re-enumeration."""
         resolved = getattr(self._camera_api, "last_resolved_camera", None)
@@ -913,11 +1026,9 @@ class LibGPhotoCameraManager:
             values = self._original_values.get(key)
             if not values:
                 return
-            try:
-                self._api().restore(selected, values)
-            except Exception:
-                # Keep the snapshot so a later release/shutdown can retry.
-                raise
+            # If restore() raises, the snapshot is kept so a later release
+            # or shutdown can retry.
+            self._api().restore(selected, values)
             self._original_values.pop(key, None)
 
     def _restore_all(self) -> None:
