@@ -16,6 +16,7 @@ ImageEditor is a part of [OpenNumismat](https://opennumismat.github.io/) project
 
 * Supports popular image formats: JPEG, PNG, BMP, TIFF, GIF, WebP
 * Capture a photo from webcam (for better results try [Camo](https://reincubate.com/camo/))
+* Capture photo from a [libgphoto2 supported camera](http://www.gphoto.org/proj/libgphoto2/support.php) (requires setup libgphoto2)
 * Image editing tools: rotate, crop (rectangle, ellipse, perspective transformation)
 * Remove background with [rembg](https://github.com/danielgatis/rembg)
 * Up to 10 Undo/Redo actions
@@ -50,6 +51,7 @@ ImageEditor is a part of [OpenNumismat](https://opennumismat.github.io/) project
 `4` - Scale 400%  
 `5` - Scale 500%  
 `6` - Scale 600%  
+`Shift`+`K` - capture image from libgphoto2 camera using last settings
 `F11` - Full screen  
 `Esc` - Quit  
 
