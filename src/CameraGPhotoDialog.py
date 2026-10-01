@@ -1,6 +1,13 @@
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtCore import (
+    QCoreApplication,
+    QObject,
+    QRunnable,
+    QThreadPool,
+    Qt,
+    Signal as pyqtSignal,
+)
 from PySide6.QtGui import QIcon, QImage
 from PySide6.QtWidgets import (
     QApplication,
@@ -59,6 +66,55 @@ HIDDEN_CAMERA_SETTING_LABELS = frozenset({
 })
 
 
+class _CameraCaptureSignals(QObject):
+    """Deliver camera capture results to the dialog's GUI thread."""
+
+    finished = pyqtSignal(object, object)
+
+
+class _CameraCaptureTask(QRunnable):
+    """Run one camera capture without blocking the dialog's event loop."""
+
+    def __init__(
+        self,
+        camera_manager: Any,
+        selected: Dict[str, str],
+        settings: Dict[str, Any],
+        preview: bool,
+        restore_target: bool,
+        signals: _CameraCaptureSignals,
+    ) -> None:
+        super().__init__()
+        self.camera_manager = camera_manager
+        self.selected = selected
+        self.settings = settings
+        self.preview = preview
+        self.restore_target = restore_target
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            image_data = self.camera_manager.capture(
+                self.selected,
+                self.settings,
+                preview=self.preview,
+                restore_target=self.restore_target,
+            )
+        except Exception as error:
+            self._emit_finished(None, str(error))
+        else:
+            self._emit_finished(image_data, None)
+
+    def _emit_finished(
+        self, image_data: Optional[bytes], error_message: Optional[str]
+    ) -> None:
+        """Ignore completion if the application has already torn down Qt."""
+        try:
+            self.signals.finished.emit(image_data, error_message)
+        except RuntimeError:
+            pass
+
+
 @storeDlgSizeDecorator
 class CameraGPhotoDialog(QDialog):
     """Dialog for choosing a libgphoto2 camera, configuring it, and capturing."""
@@ -91,6 +147,8 @@ class CameraGPhotoDialog(QDialog):
         self._standard_capture_available = False
         self._preview_available = False
         self._cached_config = False
+        self._capture_pending = False
+        self._capture_signals = None
 
         self.cameraSelector = QComboBox()
         self.cameraSelector.currentIndexChanged.connect(self.cameraSelectionChanged)
@@ -224,7 +282,7 @@ class CameraGPhotoDialog(QDialog):
         self._standard_capture_available = info["capture"]
         self.previewCheckbox.setEnabled(preview_available)
         self.previewCheckbox.blockSignals(True)
-        preview_default = preferences.get("preview", preview_available)
+        preview_default = bool(preferences.get("preview", preview_available)) and preview_available
         if preview_available and not self._standard_capture_available:
             preview_default = True
         self.previewCheckbox.setChecked(preview_default)
@@ -265,17 +323,18 @@ class CameraGPhotoDialog(QDialog):
 
     def _update_capture_availability(self) -> None:
         """Update the capture button and any RAM-safety status message."""
+        use_preview = self._preview_available and self.previewCheckbox.isChecked()
         available = not self._cached_config and (
-            self._preview_available if self.previewCheckbox.isChecked()
+            self._preview_available if use_preview
             else self._standard_ready()
         )
-        self.captureButton.setEnabled(available)
+        self.captureButton.setEnabled(available and not self._capture_pending)
         if self._cached_config:
             self.statusLabel.setText(
                 self.tr("Camera is unavailable; showing saved settings. Capture is disabled.")
             )
             return
-        if not available and not self.previewCheckbox.isChecked():
+        if not available and not use_preview:
             self.statusLabel.setText(
                 self.tr("Standard capture is unavailable unless an internal-RAM target is selected.")
             )
@@ -426,40 +485,67 @@ class CameraGPhotoDialog(QDialog):
 
     def reject(self) -> None:
         """Save current preferences before the dialog is dismissed."""
-        self._save_current_values()
+        # Preferences were saved before starting the worker; do not wait on the
+        # manager's lock while the camera operation is still in progress.
+        if not self._capture_pending:
+            self._save_current_values()
         super().reject()
 
     def capture(self) -> None:
         """Capture the selected image and accept the dialog on success."""
-        if self._selected is None:
+        if self._selected is None or self._capture_pending:
             return
         self._save_current_values()
         settings = self.camera.preferences(self._selected).get("settings", {})
         preview = self.previewCheckbox.isChecked() and self.previewCheckbox.isEnabled()
         restore_target = self.restoreTargetCheckbox.isChecked()
-        self.captureButton.setEnabled(False)
+        self._capture_pending = True
+        self._set_capture_controls_enabled(False)
         self.cameraSelector.setEnabled(False)
         self.statusLabel.setText(self.tr("Capturing preview..." if preview else "Capturing image..."))
         self.statusLabel.repaint()
-        try:
-            image_data = self.camera.capture(
-                self._selected, settings, preview=preview,
-                restore_target=restore_target,
-            )
-            image = QImage.fromData(image_data)
-            if image.isNull():
-                raise RuntimeError(
-                    self.tr("The captured data is not a supported image")
-                )
-            self.image = image
-        except (OSError, RuntimeError, AttributeError, ValueError) as error:
+        signals = _CameraCaptureSignals(QApplication.instance())
+        signals.finished.connect(self._captureFinished)
+        signals.finished.connect(signals.deleteLater)
+        self._capture_signals = signals
+        task = _CameraCaptureTask(
+            self.camera, self._selected, settings, preview, restore_target, signals
+        )
+        QThreadPool.globalInstance().start(task)
+
+    def _set_capture_controls_enabled(self, enabled: bool) -> None:
+        """Keep camera options fixed while a background capture is running."""
+        self.previewCheckbox.setEnabled(enabled and self._preview_available)
+        self.restoreTargetCheckbox.setEnabled(enabled and self._selected is not None)
+        self.reevaluateButton.setEnabled(enabled)
+        self.configWidget.setEnabled(enabled)
+
+    def _captureFinished(
+        self, image_data: Optional[bytes], error_message: Optional[str]
+    ) -> None:
+        """Handle capture completion on the GUI thread."""
+        self._capture_pending = False
+        self._capture_signals = None
+        self.cameraSelector.setEnabled(self.cameraSelector.count() > 0)
+        self._set_capture_controls_enabled(True)
+        self._update_capture_availability()
+
+        if error_message is not None:
             self.statusLabel.setText(self.tr("Capture failed."))
-            QMessageBox.warning(self, self.tr("Camera Error"), str(error))
-        else:
-            self.accept()
-        finally:
-            self.cameraSelector.setEnabled(True)
-            self._update_capture_availability()
+            QMessageBox.warning(self, self.tr("Camera Error"), error_message)
+            return
+
+        image = QImage.fromData(image_data or b"")
+        if image.isNull():
+            self.statusLabel.setText(self.tr("Capture failed."))
+            QMessageBox.warning(
+                self,
+                self.tr("Camera Error"),
+                self.tr("The captured data is not a supported image"),
+            )
+            return
+        self.image = image
+        self.accept()
 
     def reevaluateCameras(self) -> None:
         """Restore changed settings, rediscover cameras, and rebuild selection."""
