@@ -666,3 +666,302 @@ class LibGPhotoCamera:
         return choices
 
 
+class LibGPhotoCameraManager:
+    """Manage live camera state and persist per-camera config/preferences."""
+
+    _SETTINGS_KEY = "libgphoto2/state"
+
+    def __init__(self, camera_api: Optional[Any] = None, settings: Optional[Any] = None) -> None:
+        """Create a manager, optionally with test API and settings adapters."""
+        self._camera_api = camera_api
+        self._settings = settings
+        self._cameras = None
+        self._metadata = {}
+        self._persisted_metadata = set()
+        self._preferences = {}
+        self._original_values = {}
+        self._selected = {}
+        self._lock = threading.RLock()
+        self._load_persisted_state()
+
+    @staticmethod
+    def camera_key(camera: Dict[str, str]) -> Tuple[str, str]:
+        """Return the stable identity tuple for a camera record."""
+        return LibGPhotoCamera._identity(camera)
+
+    @property
+    def last_camera(self) -> Optional[Dict[str, str]]:
+        """Return a copy of the most recently selected camera, if any."""
+        return copy.deepcopy(self._selected.get("last"))
+
+    def _api(self) -> Any:
+        """Lazily construct and return the low-level camera API wrapper."""
+        if self._camera_api is None:
+            self._camera_api = LibGPhotoCamera()
+        return self._camera_api
+
+    def _settings_store(self) -> Optional[Any]:
+        """Return the injected or application-default QSettings instance."""
+        if self._settings is None:
+            try:
+                from PySide6.QtCore import QSettings
+            except ImportError:
+                return None
+            self._settings = QSettings()
+        return self._settings
+
+    def _load_persisted_state(self) -> None:
+        """Load saved preferences and config metadata, ignoring invalid data."""
+        settings = self._settings_store()
+        if settings is None:
+            return
+        try:
+            raw_state = settings.value(self._SETTINGS_KEY, "")
+            if not raw_state:
+                return
+            state = json.loads(str(raw_state))
+            if state.get("version") != 1:
+                return
+            for entry in state.get("preferences", []):
+                key = tuple(entry["camera"])
+                self._preferences[key] = entry["value"]
+            for entry in state.get("metadata", []):
+                key = tuple(entry["camera"])
+                self._metadata[key] = entry["value"]
+                self._persisted_metadata.add(key)
+            for entry in state.get("selected", []):
+                key = tuple(entry["camera"])
+                self._selected[key] = entry["value"]
+            last_camera = state.get("last_camera")
+            if last_camera:
+                self._selected["last"] = last_camera
+        except (AttributeError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            # Invalid or old state should not prevent camera use.
+            self._metadata.clear()
+            self._persisted_metadata.clear()
+            self._preferences.clear()
+            self._selected.clear()
+
+    def _persist_state(self) -> None:
+        """Write current preferences, metadata, and selection to QSettings."""
+        settings = self._settings_store()
+        if settings is None:
+            return
+        state = {
+            "version": 1,
+            "preferences": [
+                {"camera": list(key), "value": value}
+                for key, value in self._preferences.items()
+            ],
+            "metadata": [
+                {"camera": list(key), "value": value}
+                for key, value in self._metadata.items()
+            ],
+            "selected": [
+                {"camera": list(key), "value": value}
+                for key, value in self._selected.items()
+                if key != "last"
+            ],
+            "last_camera": self._selected.get("last"),
+        }
+        try:
+            settings.setValue(
+                self._SETTINGS_KEY,
+                json.dumps(state, ensure_ascii=False, allow_nan=False),
+            )
+        except (TypeError, ValueError):
+            # Keep the in-memory preferences even if a camera exposes a value
+            # that cannot be represented in the persistent JSON cache.
+            return
+
+    def cameras(self, refresh: bool = False) -> List[Dict[str, str]]:
+        """Return detected cameras, optionally refreshing the discovery cache."""
+        with self._lock:
+            if refresh or self._cameras is None:
+                self._cameras = copy.deepcopy(self._api().cameras())
+            return copy.deepcopy(self._cameras)
+
+    def inspect(
+        self, selected: Dict[str, str], refresh: bool = False
+    ) -> Dict[str, Any]:
+        """Return cached config metadata or refresh it from the selected camera."""
+        key = self.camera_key(selected)
+        with self._lock:
+            needs_live_inspection = refresh or key not in self._metadata or key in self._persisted_metadata
+            if needs_live_inspection:
+                try:
+                    api = self._api()
+                    api.last_resolved_camera = None
+                    self._metadata[key] = api.inspect(selected)
+                    self._persisted_metadata.discard(key)
+                    self._adopt_resolved_camera(key, selected)
+                    self._persist_state()
+                except Exception:
+                    if key not in self._persisted_metadata:
+                        raise
+                    # Saved schemas can keep the controls useful while a
+                    # camera is asleep or temporarily unreachable. They are
+                    # marked as cached so the UI will not offer capture.
+                    cached = copy.deepcopy(self._metadata[key])
+                    cached["_cached"] = True
+                    return cached
+            return copy.deepcopy(self._metadata.get(self.camera_key(selected), {}))
+
+    def preferences(self, selected: Dict[str, str]) -> Dict[str, Any]:
+        """Return a deep copy of preferences saved for a camera."""
+        with self._lock:
+            return copy.deepcopy(self._preferences.get(self.camera_key(selected), {}))
+
+    def save_preferences(
+        self,
+        selected: Dict[str, str],
+        settings: Dict[str, Any],
+        preview: bool,
+        restore_target: bool,
+    ) -> None:
+        """Save setting values and capture options for a camera."""
+        key = self.camera_key(selected)
+        with self._lock:
+            self._preferences[key] = {
+                "settings": copy.deepcopy(settings),
+                "preview": bool(preview),
+                "restore_target": bool(restore_target),
+            }
+            self._selected["last"] = copy.deepcopy(selected)
+            self._selected[key] = copy.deepcopy(selected)
+            self._persist_state()
+
+    def capture(
+        self,
+        selected: Dict[str, str],
+        settings: Dict[str, Any],
+        preview: bool = False,
+        restore_target: bool = True,
+    ) -> bytes:
+        """Capture with the manager's original-value restoration tracking."""
+        key = self.camera_key(selected)
+        with self._lock:
+            self._selected["last"] = copy.deepcopy(selected)
+            self._selected[key] = copy.deepcopy(selected)
+            originals = self._original_values.setdefault(key, {})
+            api = self._api()
+            api.last_resolved_camera = None
+            try:
+                image = api.capture_managed(
+                    selected, settings, originals, preview, restore_target
+                )
+            finally:
+                self._adopt_resolved_camera(key, selected, originals)
+            current = self._preferences.setdefault(key, {})
+            current.update({
+                "settings": copy.deepcopy(settings),
+                "preview": bool(preview),
+                "restore_target": bool(restore_target),
+            })
+            resolved_key = self.camera_key(selected)
+            if resolved_key != key:
+                self._preferences[resolved_key] = self._preferences.pop(key)
+            self._persist_state()
+            return image
+
+    def _adopt_resolved_camera(
+        self,
+        old_key: Tuple[str, str],
+        selected: Dict[str, str],
+        originals: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Move cached state to a camera identity resolved after re-enumeration."""
+        resolved = getattr(self._camera_api, "last_resolved_camera", None)
+        if not resolved:
+            return
+        new_key = self.camera_key(resolved)
+        if new_key == old_key:
+            return
+        if isinstance(selected, dict):
+            selected.update(resolved)
+        self._selected.pop(old_key, None)
+        self._selected[new_key] = copy.deepcopy(resolved)
+        self._selected["last"] = copy.deepcopy(resolved)
+        if old_key in self._preferences:
+            self._preferences.setdefault(new_key, self._preferences[old_key])
+            self._preferences.pop(old_key, None)
+        if old_key in self._metadata:
+            self._metadata.setdefault(new_key, self._metadata[old_key])
+            self._metadata.pop(old_key, None)
+        old_originals = self._original_values.pop(old_key, {})
+        if originals is not None:
+            old_originals.update(originals)
+        if old_originals:
+            new_originals = self._original_values.setdefault(new_key, {})
+            for path, value in old_originals.items():
+                new_originals.setdefault(path, value)
+
+    def reevaluate(self) -> List[Dict[str, str]]:
+        """Best-effort restore, then refresh camera and config discovery."""
+        with self._lock:
+            self._restore_all()
+            self._metadata.clear()
+            self._persisted_metadata.clear()
+            self._cameras = None
+            self._persist_state()
+            return self.cameras(refresh=True)
+
+    def release_camera(self, selected: Dict[str, str]) -> None:
+        """Restore this camera's original values and forget its change snapshot."""
+        key = self.camera_key(selected)
+        with self._lock:
+            values = self._original_values.get(key)
+            if not values:
+                return
+            try:
+                self._api().restore(selected, values)
+            except Exception:
+                # Keep the snapshot so a later release/shutdown can retry.
+                raise
+            self._original_values.pop(key, None)
+
+    def _restore_all(self) -> None:
+        """Best-effort restore all settings changed during this process."""
+        if self._camera_api is None:
+            return
+        pending = {}
+        for key, values in list(self._original_values.items()):
+            selected = self._selected.get(key)
+            if not selected or not values:
+                continue
+            try:
+                self._camera_api.restore(selected, values)
+            except Exception:
+                # The camera may be disconnected or asleep; cleanup is best-effort.
+                pending[key] = values
+        self._original_values = pending
+
+    def close(self) -> None:
+        """Restore camera settings and flush persistent application settings."""
+        with self._lock:
+            self._restore_all()
+            settings = self._settings_store()
+            if settings is not None and hasattr(settings, "sync"):
+                settings.sync()
+
+
+_default_manager = None
+_default_manager_lock = threading.Lock()
+
+
+def get_default_camera_manager() -> LibGPhotoCameraManager:
+    """Return the lazily-created manager shared by dialogs in this process."""
+    global _default_manager
+    with _default_manager_lock:
+        if _default_manager is None:
+            _default_manager = LibGPhotoCameraManager()
+        return _default_manager
+
+
+def _close_default_manager() -> None:
+    """Restore camera state held by the process-wide default manager."""
+    if _default_manager is not None:
+        _default_manager.close()
+
+
+atexit.register(_close_default_manager)
