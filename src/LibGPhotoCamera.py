@@ -439,3 +439,230 @@ class LibGPhotoCamera:
                 gp.gp_context_unref(context)
             raise
 
+    def _find_widget(self, root: Any, path: str) -> Any:
+        """Find a setting widget by its slash-delimited config path."""
+        widget = root
+        for segment in path.strip("/").split("/"):
+            child = ctypes.c_void_p()
+            result = self.gp.gp_widget_get_child_by_name(widget, segment.encode(), ctypes.byref(child))
+            if result < 0:
+                raise RuntimeError(f"Camera setting no longer exists: {path}")
+            widget = child
+        return widget
+
+    def _set_value(self, widget: Any, kind: int, value: Any) -> None:
+        """Set a widget using a correctly typed temporary C value."""
+        if kind in (GP_WIDGET_TOGGLE, GP_WIDGET_DATE):
+            converted = ctypes.c_int(int(value))
+            pointer = ctypes.byref(converted)
+        elif kind == GP_WIDGET_RANGE:
+            converted = ctypes.c_float(float(value))
+            pointer = ctypes.byref(converted)
+        else:
+            converted = ctypes.create_string_buffer(str(value).encode("utf-8"))
+            pointer = ctypes.cast(converted, ctypes.c_void_p)
+        result = self.gp.gp_widget_set_value(widget, pointer)
+        if result < 0:
+            raise self._error(result, "Could not set camera configuration")
+
+    def _bytes_from_file(self, camera_file: Any) -> bytes:
+        """Copy image bytes from a libgphoto2 file object."""
+        data, size = ctypes.c_char_p(), ctypes.c_ulong()
+        result = self.gp.gp_file_get_data_and_size(camera_file, ctypes.byref(data), ctypes.byref(size))
+        if result < 0:
+            raise self._error(result, "Could not read image data")
+        if not data or not size.value:
+            raise RuntimeError("Camera returned an empty image")
+        return ctypes.string_at(data, size.value)
+
+    @staticmethod
+    def _is_ram(value: Any) -> bool:
+        """Return whether a capture-target label denotes internal memory."""
+        normalized = str(value).lower().strip()
+        return "card" not in normalized and any(token in normalized for token in ("ram", "sdram", "internal"))
+
+    def capture(
+        self,
+        selected: Dict[str, str],
+        settings: Dict[str, Any],
+        preview: bool = False,
+    ) -> bytes:
+        """Apply config values, then return captured image bytes."""
+        return self._capture(selected, settings, preview, {}, True)
+
+    def _capture(
+        self,
+        selected: Dict[str, str],
+        settings: Dict[str, Any],
+        preview: bool,
+        originals: Dict[str, Any],
+        restore_target: bool,
+    ) -> bytes:
+        """Apply supported settings, enforce RAM safety, and capture an image."""
+        opened, config = self._open_and_config(selected)
+        context, camera, operations, *_ = opened
+        original_target = None
+        target_path = None
+        try:
+            required_operation = (
+                GP_OPERATION_CAPTURE_PREVIEW if preview else GP_OPERATION_CAPTURE_IMAGE
+            )
+            if not operations & required_operation:
+                mode = "preview" if preview else "standard"
+                raise RuntimeError(f"This camera does not support {mode} capture")
+            parameters = self._config_items(config)
+            live = {item["path"]: item for item in parameters}
+            target_item = next((item for item in parameters if item["path"].endswith("/capturetarget")), None)
+            if not preview:
+                if not target_item:
+                    raise RuntimeError("This camera has no capture-target setting; refusing standard capture to avoid writing to its card.")
+                original_target = target_item["value"]
+                target_path = target_item["path"]
+
+            changed = False
+            for path, value in settings.items():
+                item = live.get(path)
+                if item is None or item["readonly"]:
+                    continue
+                if path == target_path:
+                    continue
+                if item["choices"] and str(value) not in item["choices"]:
+                    continue
+                if item.get("range"):
+                    low, high, _step = item["range"]
+                    try:
+                        value = max(low, min(high, float(value)))
+                    except (TypeError, ValueError):
+                        continue
+                if value == item["value"]:
+                    continue
+                originals.setdefault(path, item["value"])
+                widget = self._find_widget(config, path)
+                self._set_value(widget, item["type"], value)
+                changed = True
+
+            if not preview:
+                target_widget = self._find_widget(config, target_path)
+                choices = self._choices(target_widget)
+                ram = next((choice for choice in choices if self._is_ram(choice)), None)
+                if not ram:
+                    raise RuntimeError("This camera does not offer an internal-RAM target; refusing to capture to its card.")
+                target_value = self._read_value(target_widget, target_item["type"])
+                if not self._is_ram(target_value):
+                    if target_item["readonly"]:
+                        raise RuntimeError("Camera capture target is read-only and is not internal RAM; refusing standard capture.")
+                    originals.setdefault(target_path, original_target)
+                    self._set_value(target_widget, target_item["type"], ram)
+                    changed = True
+
+            if changed:
+                result = self.gp.gp_camera_set_config(camera, config, context)
+                if result < 0:
+                    raise self._error(result, "Camera rejected configuration")
+
+            if not preview:
+                # Re-read after applying config to confirm the camera accepted RAM.
+                verified_config = self._get_config(camera, context)
+                try:
+                    verified_target = self._find_widget(verified_config, target_path)
+                    verified_type = ctypes.c_int()
+                    self.gp.gp_widget_get_type(verified_target, ctypes.byref(verified_type))
+                    if not self._is_ram(self._read_value(verified_target, verified_type.value)):
+                        raise RuntimeError("Camera did not confirm internal-RAM targeting; refusing standard capture.")
+                finally:
+                    self.gp.gp_widget_free(verified_config)
+
+            if preview:
+                camera_file = ctypes.c_void_p()
+                result = self.gp.gp_file_new(ctypes.byref(camera_file))
+                if result < 0:
+                    raise self._error(result, "Could not create preview image buffer")
+                try:
+                    result = self.gp.gp_camera_capture_preview(camera, camera_file, context)
+                    if result < 0:
+                        raise self._error(result, "Camera preview capture failed")
+                    return self._bytes_from_file(camera_file)
+                finally:
+                    self.gp.gp_file_free(camera_file)
+
+            path = CameraFilePath()
+            result = self.gp.gp_camera_capture(camera, 0, ctypes.byref(path), context)
+            if result < 0:
+                raise self._error(result, "Camera capture failed")
+            folder = bytes(path.folder).split(b"\0", 1)[0]
+            name = bytes(path.name).split(b"\0", 1)[0]
+            if not folder or not name:
+                raise RuntimeError("Camera capture returned an empty file path")
+            camera_file = ctypes.c_void_p()
+            result = self.gp.gp_file_new(ctypes.byref(camera_file))
+            if result < 0:
+                raise self._error(result, "Could not create image buffer")
+            try:
+                result = self.gp.gp_camera_file_get(camera, folder, name, GP_FILE_TYPE_NORMAL, camera_file, context)
+                if result < 0:
+                    raise self._error(result, "Could not retrieve captured image")
+                return self._bytes_from_file(camera_file)
+            finally:
+                self.gp.gp_file_free(camera_file)
+                self.gp.gp_camera_file_delete(camera, folder, name, context)
+        finally:
+            if config:
+                if restore_target and original_target is not None:
+                    try:
+                        target_widget = self._find_widget(config, target_path)
+                        current = self._read_value(target_widget, target_item["type"])
+                        if current != original_target:
+                            self._set_value(target_widget, target_item["type"], original_target)
+                            self.gp.gp_camera_set_config(camera, config, context)
+                    except Exception:
+                        pass
+                self.gp.gp_widget_free(config)
+            self._close(opened)
+
+    def capture_managed(
+        self,
+        selected: Dict[str, str],
+        settings: Dict[str, Any],
+        originals: Dict[str, Any],
+        preview: bool = False,
+        restore_target: bool = True,
+    ) -> bytes:
+        """Capture while recording original values for manager cleanup."""
+        return self._capture(selected, settings, preview, originals, restore_target)
+
+    def restore(self, selected: Dict[str, str], values: Dict[str, Any]) -> None:
+        """Best-effort apply saved original values to a camera's live config."""
+        if not values:
+            return
+        opened, config = self._open_and_config(selected)
+        context, camera, *_ = opened
+        try:
+            live = {item["path"]: item for item in self._config_items(config)}
+            changed = False
+            for path, value in values.items():
+                item = live.get(path)
+                if item is None or item["readonly"] or item["value"] == value:
+                    continue
+                if item["choices"] and str(value) not in item["choices"]:
+                    continue
+                widget = self._find_widget(config, path)
+                self._set_value(widget, item["type"], value)
+                changed = True
+            if changed:
+                result = self.gp.gp_camera_set_config(camera, config, context)
+                if result < 0:
+                    raise self._error(result, "Could not restore camera settings")
+        finally:
+            self.gp.gp_widget_free(config)
+            self._close(opened)
+
+    def _choices(self, widget: Any) -> List[str]:
+        """Return the current string choices advertised by a widget."""
+        choices = []
+        for index in range(self.gp.gp_widget_count_choices(widget)):
+            choice = ctypes.c_char_p()
+            if self.gp.gp_widget_get_choice(widget, index, ctypes.byref(choice)) >= 0:
+                choices.append(_decode(choice.value))
+        return choices
+
+
