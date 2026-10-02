@@ -30,7 +30,7 @@ GP_FILE_TYPE_NORMAL = 0
 # as the DLL search path is needed; garbage-collecting one removes its
 # directory and can break lazy loading of libgphoto2 plugin dependencies.
 _dll_directory_handles = []
-_msvcrt_runtime = None
+_ucrt_runtime = None
 
 
 # Opaque handle held by or returned from libgphoto2's C API. Functions whose
@@ -107,10 +107,10 @@ class CameraFilePath(ctypes.Structure):
 
 
 def _msys2_paths() -> Tuple[str, str, str]:
-    """Return the MSYS2 binary, camera-driver, and port-driver directories."""
-    msys2_bin = r"C:\msys64\mingw64\bin"
+    """Return the MSYS2 UCRT64 binary, camera-driver, and port-driver directories."""
+    msys2_bin = r"C:\msys64\ucrt64\bin"
     if not os.path.isdir(msys2_bin):
-        raise OSError(f"MSYS2 bin folder not found at {msys2_bin}")
+        raise OSError(f"MSYS2 UCRT64 bin folder not found at {msys2_bin}")
 
     def versioned_directory(path: str) -> str:
         """Choose the newest numeric-version subdirectory under ``path``."""
@@ -133,15 +133,15 @@ def _msys2_paths() -> Tuple[str, str, str]:
 
 
 def _set_msys2_environment(name: str, value: str) -> None:
-    """Set a process environment variable for the MSYS2 C runtime."""
-    global _msvcrt_runtime
-    if _msvcrt_runtime is None:
-        _msvcrt_runtime = ctypes.CDLL("msvcrt.dll")
-    putenv = _msvcrt_runtime._putenv
+    """Set a process environment variable for the MSYS2 UCRT64 runtime."""
+    global _ucrt_runtime
+    if _ucrt_runtime is None:
+        _ucrt_runtime = ctypes.CDLL("ucrtbase.dll")
+    putenv = _ucrt_runtime._putenv
     putenv.argtypes = [ctypes.c_char_p]
     putenv.restype = ctypes.c_int
     if putenv(os.fsencode(f"{name}={value}")) != 0:
-        raise OSError(f"Could not set {name} for the MSYS2 runtime")
+        raise OSError(f"Could not set {name} for the MSYS2 UCRT64 runtime")
 
 
 def _load_libraries() -> Tuple[ctypes.CDLL, ctypes.CDLL]:
