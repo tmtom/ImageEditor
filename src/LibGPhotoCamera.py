@@ -24,7 +24,12 @@ GP_WIDGET_BUTTON = 7
 GP_WIDGET_DATE = 8
 GP_OPERATION_CAPTURE_IMAGE = 1
 GP_OPERATION_CAPTURE_PREVIEW = 8
-GP_FILE_TYPE_NORMAL = 0
+# CameraFileType values from gphoto2-file.h; the enum starts at PREVIEW, so
+# GP_FILE_TYPE_NORMAL is 1, not 0. Passing 0 downloads the thumbnail instead
+# of the image, which fails for freshly captured files that have no thumbnail.
+GP_FILE_TYPE_PREVIEW = 0
+GP_FILE_TYPE_NORMAL = 1
+GP_FILE_TYPE_RAW = 2
 
 # Handles returned by os.add_dll_directory() must stay referenced for as long
 # as the DLL search path is needed; garbage-collecting one removes its
@@ -109,7 +114,7 @@ class CameraFilePath(ctypes.Structure):
 
 _INSTALL_HINT = (
     "Camera capture is optional: install MSYS2 UCRT64 plus the package "
-    "mingw-w64-ucrt-x86_64-gphoto2 to enable it (see libgphoto2_win.md)."
+    "mingw-w64-ucrt-x86_64-gphoto2 to enable it (see README_libgphoto2.md)."
 )
 
 
@@ -218,6 +223,10 @@ def _configure_api(gp: ctypes.CDLL, port: ctypes.CDLL) -> None:
     gp.gp_camera_autodetect.restype = i
     gp.gp_result_as_string.argtypes = [i]
     gp.gp_result_as_string.restype = ctypes.c_char_p
+    # gp_setting_get(char *id, char *key, char *value) writes the setting's
+    # canonical name into a caller-provided buffer.
+    gp.gp_setting_get.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
+    gp.gp_setting_get.restype = i
 
     gp.gp_abilities_list_new.argtypes = [ctypes.POINTER(p)]
     gp.gp_abilities_list_load.argtypes = [p, p]
@@ -269,6 +278,22 @@ def _configure_api(gp: ctypes.CDLL, port: ctypes.CDLL) -> None:
 def _decode(value: Optional[bytes]) -> str:
     """Decode a nullable UTF-8 string returned by libgphoto2."""
     return value.decode("utf-8", errors="replace") if value else ""
+
+
+def classify_capture_target(value: Value) -> Optional[bool]:
+    """Classify a capture-target widget value: True = RAM, False = card.
+
+    Returns ``None`` when the value cannot be classified: capture-target
+    choices are gettext-translated labels, so keyword matching fails in
+    some locales. Callers then fall back to the driver's canonical
+    ``ptp2/capturetarget`` setting ("sdram"/"card") instead of guessing.
+    """
+    normalized = str(value).lower().strip()
+    if "card" in normalized:
+        return False
+    if any(token in normalized for token in ("ram", "sdram", "internal")):
+        return True
+    return None
 
 
 class LibGPhotoCamera:
@@ -408,7 +433,10 @@ class LibGPhotoCamera:
                 None,
             )
             ram_available = bool(
-                target and any(self._is_ram(choice) for choice in target["choices"])
+                target and (
+                    any(classify_capture_target(choice) is True for choice in target["choices"])
+                    or self._target_is_ram_value(target["value"])
+                )
             )
             return {
                 "parameters": parameters,
@@ -578,11 +606,81 @@ class LibGPhotoCamera:
             raise RuntimeError("Camera returned an empty image")
         return ctypes.string_at(data, size.value)
 
+    def _driver_capture_target(self) -> str:
+        """Read the driver's canonical capture-target name ("sdram"/"card").
+
+        For Nikon, Canon and Panasonic the "Capture Target" widget is just
+        a view of the gphoto2 setting ``ptp2/capturetarget``; an unset key
+        means "sdram", mirroring the driver's own default.
+        """
+        buffer = ctypes.create_string_buffer(1024)
+        if self.gp.gp_setting_get(b"ptp2", b"capturetarget", buffer) < 0:
+            return "sdram"
+        return _decode(buffer.value) or "sdram"
+
+    def _target_is_ram_value(self, value: Value) -> bool:
+        """Return whether a capture-target value means internal memory.
+
+        Unclassifiable (translated) labels fall back to the driver's
+        canonical setting. Sony's untranslated "sdram"/"card"/"card+sdram"
+        values always classify directly and never reach the fallback.
+        """
+        classification = classify_capture_target(value)
+        if classification is not None:
+            return classification
+        return self._driver_capture_target() == "sdram"
+
     @staticmethod
-    def _is_ram(value: Value) -> bool:
-        """Return whether a capture-target label denotes internal memory."""
-        normalized = str(value).lower().strip()
-        return "card" not in normalized and any(token in normalized for token in ("ram", "sdram", "internal"))
+    def _is_volatile_capture_folder(folder: bytes) -> bool:
+        """Return whether a captured file lives in camera RAM, not on a card.
+
+        The ptp2 driver names RAM captures after the virtual root "/" or
+        the synthetic "/store_XXXXXXXX" folder it fabricates, while real
+        card files carry deeper paths like "/store_00010001/DCIM/100CANON".
+        """
+        segments = folder.decode("ascii", "replace").rstrip("/").split("/")
+        return segments == [""] or (len(segments) == 2 and segments[1].startswith("store_"))
+
+    def _rejected_settings(
+        self,
+        camera: Handle,
+        context: Handle,
+        changes: List[Tuple[str, ConfigItem, Value]],
+        result: int,
+    ) -> RuntimeError:
+        """Explain which changed settings the camera refused to accept.
+
+        A whole-tree ``gp_camera_set_config`` failure reports only one
+        generic result code; re-applying each change on its own fresh tree
+        identifies the rejected ones so the message can name them. A change
+        accepted alone stays applied to the camera; if every change succeeds
+        alone, the original error is reported unchanged.
+        """
+        rejected: List[str] = []
+        for path, item, value in changes:
+            reason = None
+            tree = None
+            try:
+                tree = self._get_config(camera, context)
+                widget = self._find_widget(tree, path)
+                self._set_value(widget, item["type"], value)
+                single = self.gp.gp_camera_set_config(camera, tree, context)
+                if single < 0:
+                    reason = _decode(self.gp.gp_result_as_string(single)) or f"error {single}"
+            except Exception as error:
+                reason = str(error)
+            finally:
+                if tree:
+                    self.gp.gp_widget_free(tree)
+            if reason is not None:
+                rejected.append(f"{item['label']} ({path}): {reason}")
+        if not rejected:
+            return self._error(result, "Camera rejected configuration")
+        return RuntimeError(
+            "Camera rejected configuration - "
+            + "; ".join(rejected)
+            + ". Clear or change these settings and try again."
+        )
 
     def capture(
         self,
@@ -629,7 +727,7 @@ class LibGPhotoCamera:
                 original_target = target_item["value"]
                 target_path = target_item["path"]
 
-            changed = False
+            changes: List[Tuple[str, ConfigItem, Value]] = []
             for path, value in settings.items():
                 item = live.get(path)
                 if item is None or item["readonly"]:
@@ -655,27 +753,33 @@ class LibGPhotoCamera:
                     originals.setdefault(path, item["value"])
                 widget = self._find_widget(config, path)
                 self._set_value(widget, item["type"], value)
-                changed = True
+                changes.append((path, item, value))
 
             if not preview:
                 target_widget = self._find_widget(config, target_path)
-                choices = self._choices(target_widget)
-                ram = next((choice for choice in choices if self._is_ram(choice)), None)
-                if not ram:
-                    raise RuntimeError("This camera does not offer an internal-RAM target; refusing to capture to its card.")
                 target_value = self._read_value(target_widget, target_item["type"])
-                if not self._is_ram(target_value):
+                if not self._target_is_ram_value(target_value):
+                    # Write only a RAM choice we can name with certainty: a
+                    # translated label we cannot classify is unusable, and
+                    # guessing could capture to the user's card.
+                    choices = self._choices(target_widget)
+                    ram = next(
+                        (choice for choice in choices if classify_capture_target(choice) is True),
+                        None,
+                    )
+                    if ram is None:
+                        raise RuntimeError("This camera does not offer an internal-RAM target; refusing to capture to its card.")
                     if target_item["readonly"]:
                         raise RuntimeError("Camera capture target is read-only and is not internal RAM; refusing standard capture.")
                     if original_target is not None:
                         originals.setdefault(target_path, original_target)
                     self._set_value(target_widget, target_item["type"], ram)
-                    changed = True
+                    changes.append((target_path, target_item, ram))
 
-            if changed:
+            if changes:
                 result = self.gp.gp_camera_set_config(camera, config, context)
                 if result < 0:
-                    raise self._error(result, "Camera rejected configuration")
+                    raise self._rejected_settings(camera, context, changes, result)
 
             if not preview:
                 # Re-read after applying config to confirm the camera accepted RAM.
@@ -684,7 +788,7 @@ class LibGPhotoCamera:
                     verified_target = self._find_widget(verified_config, target_path)
                     verified_type = ctypes.c_int()
                     self.gp.gp_widget_get_type(verified_target, ctypes.byref(verified_type))
-                    if not self._is_ram(self._read_value(verified_target, verified_type.value)):
+                    if not self._target_is_ram_value(self._read_value(verified_target, verified_type.value)):
                         raise RuntimeError("Camera did not confirm internal-RAM targeting; refusing standard capture.")
                 finally:
                     self.gp.gp_widget_free(verified_config)
@@ -714,14 +818,21 @@ class LibGPhotoCamera:
             result = self.gp.gp_file_new(ctypes.byref(camera_file))
             if result < 0:
                 raise self._error(result, "Could not create image buffer")
+            downloaded = False
             try:
                 result = self.gp.gp_camera_file_get(camera, folder, name, GP_FILE_TYPE_NORMAL, camera_file, context)
                 if result < 0:
                     raise self._error(result, "Could not retrieve captured image")
-                return self._bytes_from_file(camera_file)
+                image = self._bytes_from_file(camera_file)
+                downloaded = True
+                return image
             finally:
                 self.gp.gp_file_free(camera_file)
-                self.gp.gp_camera_file_delete(camera, folder, name, context)
+                # Delete only after the bytes are safely in hand, and only
+                # from camera RAM: a failed download would leave the photo's
+                # only copy here, and a card file must never be deleted.
+                if downloaded and self._is_volatile_capture_folder(folder):
+                    self.gp.gp_camera_file_delete(camera, folder, name, context)
         finally:
             if config:
                 if restore_target and original_target is not None:
@@ -980,6 +1091,22 @@ class LibGPhotoCameraManager:
             }
             self._selected["last"] = copy.deepcopy(selected)
             self._selected[key] = copy.deepcopy(selected)
+            self._persist_state()
+
+    def reset_preferences(self, selected: Dict[str, str]) -> None:
+        """Forget a camera's saved values and cached configuration schema.
+
+        The next inspection re-reads the camera's live configuration, so the
+        dialog can reload the camera's own current settings. gphoto2 exposes
+        no factory defaults - a config tree carries only each setting's
+        current value and allowed choices - so "reset" means returning to the
+        values the camera itself reports now.
+        """
+        key = self.camera_key(selected)
+        with self._lock:
+            self._preferences.pop(key, None)
+            self._metadata.pop(key, None)
+            self._persisted_metadata.discard(key)
             self._persist_state()
 
     def capture(

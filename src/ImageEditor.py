@@ -2382,7 +2382,7 @@ class ImageEditorDialog(QDialog):
             QMessageBox.warning(
                 self,
                 self.tr("Camera Error"),
-                self.tr("Captured data is not a supported image."),
+                self.tr("The captured data is not a supported image. If the camera shoots RAW, switch its image format to JPEG and try again."),
             )
             return
         if self.hasImage():
