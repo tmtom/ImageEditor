@@ -2344,10 +2344,12 @@ class ImageEditorDialog(QDialog):
         manager = self.camera_manager or get_default_camera_manager()
         selected = manager.last_camera
         if selected is None:
+            unavailable = manager.availability_error()
             QMessageBox.warning(
                 self,
                 self.tr("Camera Error"),
-                self.tr(
+                unavailable
+                or self.tr(
                     "No libgphoto2 camera is configured. Open Camera (libgphoto2) to configure one."
                 ),
             )

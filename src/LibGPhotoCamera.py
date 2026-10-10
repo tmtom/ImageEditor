@@ -30,6 +30,7 @@ GP_FILE_TYPE_NORMAL = 0
 # as the DLL search path is needed; garbage-collecting one removes its
 # directory and can break lazy loading of libgphoto2 plugin dependencies.
 _dll_directory_handles = []
+_preloaded_dlls = []
 _ucrt_runtime = None
 
 
@@ -106,11 +107,17 @@ class CameraFilePath(ctypes.Structure):
     _fields_ = [("name", ctypes.c_char * 128), ("folder", ctypes.c_char * 1024)]
 
 
+_INSTALL_HINT = (
+    "Camera capture is optional: install MSYS2 UCRT64 plus the package "
+    "mingw-w64-ucrt-x86_64-gphoto2 to enable it (see libgphoto2_win.md)."
+)
+
+
 def _msys2_paths() -> Tuple[str, str, str]:
     """Return the MSYS2 UCRT64 binary, camera-driver, and port-driver directories."""
     msys2_bin = r"C:\msys64\ucrt64\bin"
     if not os.path.isdir(msys2_bin):
-        raise OSError(f"MSYS2 UCRT64 bin folder not found at {msys2_bin}")
+        raise OSError(f"No libgphoto2 installation at {msys2_bin}. {_INSTALL_HINT}")
 
     def versioned_directory(path: str) -> str:
         """Choose the newest numeric-version subdirectory under ``path``."""
@@ -120,7 +127,7 @@ def _msys2_paths() -> Tuple[str, str, str]:
             and all(part.isdigit() for part in name.split("."))
         ]
         if not versions:
-            raise OSError(f"No libgphoto2 plugin directory found in {path}")
+            raise OSError(f"No libgphoto2 plugin directory found in {path}. {_INSTALL_HINT}")
         versions.sort(key=lambda item: tuple(int(part) for part in item.split(".")))
         return os.path.join(path, versions[-1])
 
@@ -151,10 +158,32 @@ def _load_libraries() -> Tuple[ctypes.CDLL, ctypes.CDLL]:
         _dll_directory_handles.append(os.add_dll_directory(msys2_bin))
         _set_msys2_environment("CAMLIBS", camlibs)
         _set_msys2_environment("IOLIBS", iolibs)
-        return (
-            ctypes.CDLL(os.path.join(msys2_bin, "libgphoto2-6.dll")),
-            ctypes.CDLL(os.path.join(msys2_bin, "libgphoto2_port-12.dll")),
-        )
+        # libgphoto2 loads its camlib and port-driver plugins at runtime with
+        # plain LoadLibrary calls, and resolving a plugin's own dependencies
+        # (usb1.dll needs libusb-1.0.dll) ignores os.add_dll_directory(): it
+        # falls back to the process PATH. Outside an MSYS2 shell PATH usually
+        # lacks the MSYS2 bin folder, the usb1 port driver then fails to load
+        # and autodetection silently reports zero cameras. Prepending the bin
+        # folder to PATH and preloading the plugin dependencies makes plugin
+        # loading independent of how the app was started. The preloaded
+        # handles must stay referenced to keep the DLLs loaded.
+        os.environ["PATH"] = msys2_bin + os.pathsep + os.environ.get("PATH", "")
+        for dependency in (
+            "libusb-1.0.dll",
+            "libgcc_s_seh-1.dll",
+            "libwinpthread-1.dll",
+            "libltdl-7.dll",
+        ):
+            dependency_path = os.path.join(msys2_bin, dependency)
+            if os.path.isfile(dependency_path):
+                _preloaded_dlls.append(ctypes.CDLL(dependency_path))
+        try:
+            return (
+                ctypes.CDLL(os.path.join(msys2_bin, "libgphoto2-6.dll")),
+                ctypes.CDLL(os.path.join(msys2_bin, "libgphoto2_port-12.dll")),
+            )
+        except OSError as error:
+            raise OSError(f"Could not load libgphoto2: {error}. {_INSTALL_HINT}") from error
     if sys.platform.startswith("linux"):
         try:
             return ctypes.CDLL("libgphoto2.so.6"), ctypes.CDLL("libgphoto2_port.so.12")
@@ -797,6 +826,19 @@ class LibGPhotoCameraManager:
     def last_camera(self) -> Optional[Dict[str, str]]:
         """Return a copy of the most recently selected camera, if any."""
         return copy.deepcopy(self._selected.get("last"))
+
+    def availability_error(self) -> Optional[str]:
+        """Return why the libgphoto2 runtime is unusable, or None if it loaded.
+
+        Callers on machines without a libgphoto2 install use this to report
+        the missing runtime only when camera capture is actually requested.
+        """
+        with self._lock:
+            try:
+                self._api()
+            except Exception as error:
+                return str(error)
+        return None
 
     def _api(self) -> LibGPhotoCamera:
         """Lazily construct and return the low-level camera API wrapper."""
