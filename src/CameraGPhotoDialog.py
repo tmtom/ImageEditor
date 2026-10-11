@@ -77,6 +77,11 @@ HIDDEN_CAMERA_SETTING_NAMES = frozenset({
     "syncdatetimeutc",
     "opcode",
     "listallfiles",
+    # libgphoto2 driver preference selecting the size of downloaded
+    # previews/thumbnails (normal/large, Nikon GetLargeThumb). Not a camera
+    # property and irrelevant here: captures download the full image and
+    # previews come from gp_camera_capture_preview, never a file preview.
+    "thumbsize",
 })
 
 # Settings hidden from the dialog, matched against normalized libgphoto2
@@ -91,7 +96,10 @@ HIDDEN_CAMERA_SETTING_LABELS = frozenset({
     "dateandtime",
     "cameradateandtime",
     "listallfiles",
-    "opcode"
+    "opcode",
+    # "Thumb Size" (libgphoto2's preview-thumbnail download preference);
+    # covered by HIDDEN_CAMERA_SETTING_NAMES, kept here as a fallback.
+    "thumbsize"
 })
 
 # Normalized libgphoto2 section names whose children are momentary triggers
