@@ -12,7 +12,12 @@ Checks, in order:
 2. the core libraries load from inside the bundle;
 3. every bundled camlib/iolib plugin DLL loads (catches missing runtime
    dependencies such as libjpeg or libusb that only surface on plugin load);
-4. camera autodetection runs (zero cameras found is a pass).
+4. camera autodetection runs (zero cameras found is a pass);
+5. the same runtime also works when reached through a path with non-ASCII
+   characters (regression check: libgphoto2 receives its plugin directories
+   through the ANSI code page, and a path Python stores as UTF-8 used to
+   become an unopenable directory there, so autodetection failed with
+   "Error loading a library").
 
 MSYS2 paths are removed from PATH first so a dependency accidentally resolved
 from a developer's MSYS2 installation fails here instead of on a user machine.
@@ -21,7 +26,10 @@ from a developer's MSYS2 installation fails here instead of on a user machine.
 import argparse
 import ctypes
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 
 
 def is_within(path, root):
@@ -38,6 +46,62 @@ def strip_msys2_from_path():
         if entry and "msys64" not in entry.lower() and "msys32" not in entry.lower()
     ]
     os.environ["PATH"] = os.pathsep.join(kept)
+
+
+def ansi_non_ascii_char():
+    """Return a non-ASCII character the ANSI code page can represent.
+
+    Such a character makes a path non-ASCII for Python (which stores paths as
+    UTF-8) while staying representable for ANSI-based code like the MSYS2
+    libgphoto2 runtime - exactly the mix that broke plugin loading.
+    """
+    for byte in range(0x80, 0x100):
+        try:
+            char = bytes([byte]).decode("mbcs")
+        except UnicodeDecodeError:
+            continue
+        if len(char) == 1 and not char.isascii():
+            return char
+    return None
+
+
+def make_junction(link, target):
+    """Create a directory junction, which needs no administrator rights."""
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", link, target],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def check_non_ascii_path(bundle):
+    """Verify the runtime loads when reached through a non-ASCII path."""
+    import LibGPhotoCamera  # already on sys.path, set up by main()
+
+    char = ansi_non_ascii_char()
+    if char is None:
+        print("skipped: no non-ASCII character in this ANSI code page")
+        return
+    temp = tempfile.mkdtemp(prefix="gphoto2-bundle-")
+    link = os.path.join(temp, "non-ascii-" + char)
+    try:
+        if not make_junction(link, bundle):
+            print(f"skipped: could not create a junction to {bundle}")
+            return
+        os.environ["GPHOTO2_RUNTIME"] = link
+        camera = LibGPhotoCamera.LibGPhotoCamera()
+        found = camera.cameras()
+        print(f"ok: runtime loads via a non-ASCII path "
+              f"({len(found)} camera(s) found)")
+    except Exception as error:
+        sys.exit(f"FAIL: runtime did not load via a non-ASCII path: {error}")
+    finally:
+        os.environ["GPHOTO2_RUNTIME"] = bundle
+        try:
+            os.rmdir(link)  # removes the junction only, never the bundle
+        except OSError:
+            pass
+        shutil.rmtree(temp, ignore_errors=True)
 
 
 def main():
@@ -88,6 +152,11 @@ def main():
     print(f"ok: camera autodetection ran ({len(found)} camera(s) found)")
     for entry in found:
         print(f"    {entry['model']} at {entry['port']}")
+
+    if sys.platform.startswith("win"):
+        check_non_ascii_path(bundle)
+    else:
+        print("skipped: non-ASCII path check is Windows-only")
     print("PASS: bundled libgphoto2 runtime is self-contained")
 
 

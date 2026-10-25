@@ -31,6 +31,10 @@ GP_OPERATION_CAPTURE_PREVIEW = 8
 GP_FILE_TYPE_PREVIEW = 0
 GP_FILE_TYPE_NORMAL = 1
 GP_FILE_TYPE_RAW = 2
+# libgphoto2_port result code (gphoto2-port-result.h), reported by camera
+# autodetection when not a single camera/port driver plugin could be loaded
+# from the CAMLIBS/IOLIBS directories.
+GP_ERROR_LIBRARY = -4
 
 # Handles returned by os.add_dll_directory() must stay referenced for as long
 # as the DLL search path is needed; garbage-collecting one removes its
@@ -192,6 +196,70 @@ def _dll_named(binary_dir: str, pattern: str, description: str) -> str:
     return matches[-1]
 
 
+def _short_path(path: str) -> Optional[str]:
+    """Return the ASCII 8.3 short form of an existing path, when there is one.
+
+    Short names hand a path to code that only understands narrow (ANSI)
+    strings, such as the MSYS2 libgphoto2 runtime, without any code-page
+    conversion. Returns ``None`` when Windows has no short name for the path
+    (8.3 names can be disabled per volume) or when the short name is not
+    plain ASCII.
+    """
+    get_short_path_name = ctypes.windll.kernel32.GetShortPathNameW
+    get_short_path_name.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+    ]
+    get_short_path_name.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_short_path_name(path, buffer, len(buffer))
+    if not length or length >= len(buffer):
+        return None
+    short = buffer.value
+    return short if short.isascii() else None
+
+
+def _narrow_path(path: str) -> bytes:
+    """Encode a path for the ANSI-based C runtime of the MSYS2 libgphoto2.
+
+    That runtime receives CAMLIBS/IOLIBS through ``_putenv`` and reads them
+    back with narrow ``getenv()``, opening the plugin directories through
+    ANSI Win32 APIs, so the bytes must use the process ANSI code page.
+    ``os.fsencode`` sends UTF-8 instead, and any non-ASCII character in the
+    install path then names a directory that does not exist: libgphoto2
+    loads no port drivers and autodetection fails with "Error loading a
+    library". Prefer the ASCII-only 8.3 form of the path, fall back to the
+    ANSI code page, and report paths neither encoding can represent.
+    """
+    short = _short_path(path)
+    if short:
+        return short.encode("ascii")
+    try:
+        return path.encode("mbcs")
+    except UnicodeEncodeError:
+        raise OSError(
+            f"Cannot hand the path {path} to libgphoto2: its characters cannot "
+            "be represented in the system code page. Move OpenNumismat to a "
+            "path written with characters from your system language "
+            "(e.g. C:\\OpenNumismat) and try again."
+        ) from None
+
+
+def _plugin_load_hint() -> str:
+    """Explain a GP_ERROR_LIBRARY result from libgphoto2's plugin loader."""
+    try:
+        _binary_dir, camlibs, iolibs = _runtime_paths()
+        source = f" from {camlibs} and {iolibs}"
+    except OSError:
+        source = ""
+    return (
+        f"libgphoto2 loaded no camera or port driver plugins{source}. "
+        "Antivirus software can block these unsigned DLLs; a path containing "
+        "characters outside the system code page also prevents libgphoto2 "
+        "from finding its plugins, so try a simple path such as "
+        "C:\\OpenNumismat."
+    )
+
+
 def _set_msys2_environment(name: str, value: str) -> None:
     """Set a process environment variable for the MSYS2 UCRT64 runtime."""
     global _ucrt_runtime
@@ -200,7 +268,11 @@ def _set_msys2_environment(name: str, value: str) -> None:
     putenv = _ucrt_runtime._putenv
     putenv.argtypes = [ctypes.c_char_p]
     putenv.restype = ctypes.c_int
-    if putenv(os.fsencode(f"{name}={value}")) != 0:
+    # _putenv is the narrow (ANSI) API of the C runtime shared with the
+    # MSYS2 libgphoto2, so the value must go in as ANSI-safe bytes - see
+    # _narrow_path for why os.fsencode is wrong here.
+    entry = name.encode("ascii") + b"=" + _narrow_path(value)
+    if putenv(entry) != 0:
         raise OSError(f"Could not set {name} for the MSYS2 UCRT64 runtime")
 
 
@@ -219,8 +291,11 @@ def _load_libraries() -> Tuple[ctypes.CDLL, ctypes.CDLL]:
         # and autodetection silently reports zero cameras. Prepending the bin
         # folder to PATH and preloading the plugin dependencies makes plugin
         # loading independent of how the app was started. The preloaded
-        # handles must stay referenced to keep the DLLs loaded.
-        os.environ["PATH"] = binary_dir + os.pathsep + os.environ.get("PATH", "")
+        # handles must stay referenced to keep the DLLs loaded. The PATH entry
+        # uses the same ANSI-safe form as CAMLIBS/IOLIBS, so narrow-based
+        # searches by the plugin loader see a path they can open.
+        search_dir = _narrow_path(binary_dir).decode("mbcs")
+        os.environ["PATH"] = search_dir + os.pathsep + os.environ.get("PATH", "")
         for dependency in (
             "libusb-1.0.dll",
             "libgcc_s_seh-1.dll",
@@ -359,6 +434,8 @@ class LibGPhotoCamera:
     def _error(self, result: int, operation: str) -> RuntimeError:
         """Create a readable exception for a negative libgphoto2 result."""
         detail = _decode(self.gp.gp_result_as_string(result)) or f"error {result}"
+        if result == GP_ERROR_LIBRARY:
+            detail += ". " + _plugin_load_hint()
         return RuntimeError(f"{operation}: {detail}")
 
     def cameras(self) -> List[Dict[str, str]]:
