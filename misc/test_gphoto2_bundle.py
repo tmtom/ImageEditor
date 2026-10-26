@@ -119,6 +119,16 @@ def main():
 
     strip_msys2_from_path()
     os.environ["GPHOTO2_RUNTIME"] = bundle
+    if sys.platform.startswith("win"):
+        # Reproduce a frozen application's startup order: msvcrt.dll snapshots
+        # the process environment when it is loaded and the MSYS2 libgphoto2
+        # reads that copy. Poison CAMLIBS/IOLIBS before loading msvcrt so a
+        # loader that updates only one C runtime's copy of the environment
+        # (or only the OS one) fails autodetection here instead of on a user
+        # machine without a configured runtime.
+        os.environ["CAMLIBS"] = os.path.join(bundle, "no-such-camlibs")
+        os.environ["IOLIBS"] = os.path.join(bundle, "no-such-iolibs")
+        ctypes.CDLL("msvcrt.dll")
     sys.path.insert(
         0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "src")
     )

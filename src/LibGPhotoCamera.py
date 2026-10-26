@@ -41,7 +41,18 @@ GP_ERROR_LIBRARY = -4
 # directory and can break lazy loading of libgphoto2 plugin dependencies.
 _dll_directory_handles = []
 _preloaded_dlls = []
-_ucrt_runtime = None
+# Each C runtime keeps its own copy of the environment; cached handles keep
+# them alive and let _set_msys2_environment update every copy.
+_crt_runtimes: Dict[str, ctypes.CDLL] = {}
+
+
+def _crt(runtime: str) -> ctypes.CDLL:
+    """Return a loaded C runtime by DLL name, caching the handle."""
+    dll = _crt_runtimes.get(runtime)
+    if dll is None:
+        dll = ctypes.CDLL(runtime)
+        _crt_runtimes[runtime] = dll
+    return dll
 
 
 # Opaque handle held by or returned from libgphoto2's C API. Functions whose
@@ -244,36 +255,41 @@ def _narrow_path(path: str) -> bytes:
         ) from None
 
 
-def _getenv(name: str) -> Optional[bytes]:
-    """Return an environment variable as the ANSI C runtime sees it.
+def _getenv(name: str, runtime: str = "msvcrt.dll") -> Optional[bytes]:
+    """Return an environment variable as a given C runtime sees it.
 
-    This is what the MSYS2 libgphoto2 actually reads back for CAMLIBS and
-    IOLIBS, which can differ from ``os.environ`` (Python stores wide
-    strings), so diagnostics report this view.
+    Every C runtime keeps its own copy of the environment and the MSYS2
+    libgphoto2 reads the ``msvcrt.dll`` one, so that view decides what the
+    library does; diagnostics compare it with ``ucrtbase.dll``'s copy.
     """
-    global _ucrt_runtime
-    if _ucrt_runtime is None:
-        _ucrt_runtime = ctypes.CDLL("ucrtbase.dll")
-    getenv = _ucrt_runtime.getenv
+    getenv = _crt(runtime).getenv
     getenv.argtypes = [ctypes.c_char_p]
     getenv.restype = ctypes.c_char_p
     return getenv(name.encode("ascii"))
 
 
 def _set_msys2_environment(name: str, value: str) -> None:
-    """Set a process environment variable for the MSYS2 UCRT64 runtime."""
-    global _ucrt_runtime
-    if _ucrt_runtime is None:
-        _ucrt_runtime = ctypes.CDLL("ucrtbase.dll")
-    putenv = _ucrt_runtime._putenv
-    putenv.argtypes = [ctypes.c_char_p]
-    putenv.restype = ctypes.c_int
-    # _putenv is the narrow (ANSI) API of the C runtime shared with the
-    # MSYS2 libgphoto2, so the value must go in as ANSI-safe bytes - see
-    # _narrow_path for why os.fsencode is wrong here.
-    entry = name.encode("ascii") + b"=" + _narrow_path(value)
-    if putenv(entry) != 0:
-        raise OSError(f"Could not set {name} for the MSYS2 UCRT64 runtime")
+    """Set a process environment variable for the MSYS2 libgphoto2 runtime.
+
+    Every C runtime keeps its own copy of the environment, and the MSYS2
+    libgphoto2 reads the ``msvcrt.dll`` copy, which is snapshotted when that
+    runtime is loaded. Writing only to ``ucrtbase.dll`` leaves that snapshot
+    untouched: in a frozen application msvcrt is loaded before this code
+    runs, so libgphoto2 keeps using whatever the process inherited (or its
+    compiled-in defaults) and reports "Error loading a library" on machines
+    without a configured runtime. Update every runtime copy and the OS
+    environment as well.
+    """
+    encoded = _narrow_path(value)
+    for runtime in ("ucrtbase.dll", "msvcrt.dll"):
+        putenv = _crt(runtime)._putenv
+        putenv.argtypes = [ctypes.c_char_p]
+        putenv.restype = ctypes.c_int
+        # _putenv is the narrow (ANSI) API, so the value must go in as
+        # ANSI-safe bytes - see _narrow_path for why os.fsencode is wrong.
+        if putenv(name.encode("ascii") + b"=" + encoded) != 0:
+            raise OSError(f"Could not set {name} for the {runtime} runtime")
+    os.environ[name] = encoded.decode("mbcs")
 
 
 def _load_libraries() -> Tuple[ctypes.CDLL, ctypes.CDLL]:
@@ -460,7 +476,11 @@ class LibGPhotoCamera:
                 continue
             decoded = value.decode("mbcs", errors="replace")
             state = "exists" if os.path.isdir(decoded) else "MISSING"
-            details.append(f"{name}: {decoded} ({state})")
+            detail = f"{name}: {decoded} ({state})"
+            other = _getenv(name, "ucrtbase.dll")
+            if other != value:
+                detail += f"; ucrtbase.dll sees {other!r}"
+            details.append(detail)
         for label, directory in (("camlibs", camlibs), ("iolibs", iolibs)):
             dlls = sorted(glob.glob(os.path.join(directory, "*.dll")))
             broken = []
