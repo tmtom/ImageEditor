@@ -244,20 +244,20 @@ def _narrow_path(path: str) -> bytes:
         ) from None
 
 
-def _plugin_load_hint() -> str:
-    """Explain a GP_ERROR_LIBRARY result from libgphoto2's plugin loader."""
-    try:
-        _binary_dir, camlibs, iolibs = _runtime_paths()
-        source = f" from {camlibs} and {iolibs}"
-    except OSError:
-        source = ""
-    return (
-        f"libgphoto2 loaded no camera or port driver plugins{source}. "
-        "Antivirus software can block these unsigned DLLs; a path containing "
-        "characters outside the system code page also prevents libgphoto2 "
-        "from finding its plugins, so try a simple path such as "
-        "C:\\OpenNumismat."
-    )
+def _getenv(name: str) -> Optional[bytes]:
+    """Return an environment variable as the ANSI C runtime sees it.
+
+    This is what the MSYS2 libgphoto2 actually reads back for CAMLIBS and
+    IOLIBS, which can differ from ``os.environ`` (Python stores wide
+    strings), so diagnostics report this view.
+    """
+    global _ucrt_runtime
+    if _ucrt_runtime is None:
+        _ucrt_runtime = ctypes.CDLL("ucrtbase.dll")
+    getenv = _ucrt_runtime.getenv
+    getenv.argtypes = [ctypes.c_char_p]
+    getenv.restype = ctypes.c_char_p
+    return getenv(name.encode("ascii"))
 
 
 def _set_msys2_environment(name: str, value: str) -> None:
@@ -435,8 +435,69 @@ class LibGPhotoCamera:
         """Create a readable exception for a negative libgphoto2 result."""
         detail = _decode(self.gp.gp_result_as_string(result)) or f"error {result}"
         if result == GP_ERROR_LIBRARY:
-            detail += ". " + _plugin_load_hint()
+            detail += ". " + self._plugin_diagnostics()
         return RuntimeError(f"{operation}: {detail}")
+
+    def _plugin_diagnostics(self) -> str:
+        """Explain a GP_ERROR_LIBRARY result with what the plugin loader saw.
+
+        "Error loading a library" alone cannot distinguish its causes: the
+        runtime resolving to the wrong root, plugin DLLs missing from their
+        folder, present but refused by the OS (antivirus), or listing fine
+        but failing to load again during detection. Probing the same inputs
+        libgphoto2 uses turns a support round trip into an answer.
+        """
+        details = []
+        try:
+            binary_dir, camlibs, iolibs = _runtime_paths()
+        except OSError as error:
+            return f"{error}"
+        details.append(f"runtime bin: {binary_dir}")
+        for name in ("CAMLIBS", "IOLIBS"):
+            value = _getenv(name)
+            if value is None:
+                details.append(f"{name} is not set")
+                continue
+            decoded = value.decode("mbcs", errors="replace")
+            state = "exists" if os.path.isdir(decoded) else "MISSING"
+            details.append(f"{name}: {decoded} ({state})")
+        for label, directory in (("camlibs", camlibs), ("iolibs", iolibs)):
+            dlls = sorted(glob.glob(os.path.join(directory, "*.dll")))
+            broken = []
+            for dll in dlls:
+                try:
+                    ctypes.CDLL(dll)
+                except OSError as error:
+                    broken.append(f"{os.path.basename(dll)}: {error}")
+            if not dlls:
+                state = "no plugin DLLs found"
+            elif broken:
+                state = "not loadable: " + "; ".join(broken)
+            else:
+                state = "all load"
+            details.append(f"{label}: {len(dlls)} plugin DLL(s) in {directory}: {state}")
+        # Ask libgphoto2 itself whether it can see any port drivers: a zero
+        # count means the plugins were never found; a healthy count with this
+        # error means one failed to load again while detection was running.
+        port_list = ctypes.c_void_p()
+        result = self.portlib.gp_port_info_list_new(ctypes.byref(port_list))
+        if result >= 0:
+            result = self.portlib.gp_port_info_list_load(port_list)
+            if result < 0:
+                details.append(
+                    "libgphoto2 port driver scan failed ("
+                    + _decode(self.gp.gp_result_as_string(result)) + ")"
+                )
+            else:
+                count = self.portlib.gp_port_info_list_count(port_list)
+                details.append(f"libgphoto2 port driver scan: {count} driver(s) seen")
+            self.portlib.gp_port_info_list_free(port_list)
+        return (
+            "; ".join(details)
+            + ". Antivirus software can refuse these unsigned DLLs; move "
+            "OpenNumismat to a simple path such as C:\\OpenNumismat and check "
+            "that the libgphoto2 folder sits next to OpenNumismat.exe."
+        )
 
     def cameras(self) -> List[Dict[str, str]]:
         """Enumerate currently connected cameras as model/port records."""
