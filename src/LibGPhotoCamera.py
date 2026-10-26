@@ -31,13 +31,28 @@ GP_OPERATION_CAPTURE_PREVIEW = 8
 GP_FILE_TYPE_PREVIEW = 0
 GP_FILE_TYPE_NORMAL = 1
 GP_FILE_TYPE_RAW = 2
+# libgphoto2_port result code (gphoto2-port-result.h), reported by camera
+# autodetection when not a single camera/port driver plugin could be loaded
+# from the CAMLIBS/IOLIBS directories.
+GP_ERROR_LIBRARY = -4
 
 # Handles returned by os.add_dll_directory() must stay referenced for as long
 # as the DLL search path is needed; garbage-collecting one removes its
 # directory and can break lazy loading of libgphoto2 plugin dependencies.
 _dll_directory_handles = []
 _preloaded_dlls = []
-_ucrt_runtime = None
+# Each C runtime keeps its own copy of the environment; cached handles keep
+# them alive and let _set_msys2_environment update every copy.
+_crt_runtimes: Dict[str, ctypes.CDLL] = {}
+
+
+def _crt(runtime: str) -> ctypes.CDLL:
+    """Return a loaded C runtime by DLL name, caching the handle."""
+    dll = _crt_runtimes.get(runtime)
+    if dll is None:
+        dll = ctypes.CDLL(runtime)
+        _crt_runtimes[runtime] = dll
+    return dll
 
 
 # Opaque handle held by or returned from libgphoto2's C API. Functions whose
@@ -192,16 +207,89 @@ def _dll_named(binary_dir: str, pattern: str, description: str) -> str:
     return matches[-1]
 
 
+def _short_path(path: str) -> Optional[str]:
+    """Return the ASCII 8.3 short form of an existing path, when there is one.
+
+    Short names hand a path to code that only understands narrow (ANSI)
+    strings, such as the MSYS2 libgphoto2 runtime, without any code-page
+    conversion. Returns ``None`` when Windows has no short name for the path
+    (8.3 names can be disabled per volume) or when the short name is not
+    plain ASCII.
+    """
+    get_short_path_name = ctypes.windll.kernel32.GetShortPathNameW
+    get_short_path_name.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+    ]
+    get_short_path_name.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_short_path_name(path, buffer, len(buffer))
+    if not length or length >= len(buffer):
+        return None
+    short = buffer.value
+    return short if short.isascii() else None
+
+
+def _narrow_path(path: str) -> bytes:
+    """Encode a path for the ANSI-based C runtime of the MSYS2 libgphoto2.
+
+    That runtime receives CAMLIBS/IOLIBS through ``_putenv`` and reads them
+    back with narrow ``getenv()``, opening the plugin directories through
+    ANSI Win32 APIs, so the bytes must use the process ANSI code page.
+    ``os.fsencode`` sends UTF-8 instead, and any non-ASCII character in the
+    install path then names a directory that does not exist: libgphoto2
+    loads no port drivers and autodetection fails with "Error loading a
+    library". Prefer the ASCII-only 8.3 form of the path, fall back to the
+    ANSI code page, and report paths neither encoding can represent.
+    """
+    short = _short_path(path)
+    if short:
+        return short.encode("ascii")
+    try:
+        return path.encode("mbcs")
+    except UnicodeEncodeError:
+        raise OSError(
+            f"Cannot hand the path {path} to libgphoto2: its characters cannot "
+            "be represented in the system code page. Move OpenNumismat to a "
+            "path written with characters from your system language "
+            "(e.g. C:\\OpenNumismat) and try again."
+        ) from None
+
+
+def _getenv(name: str, runtime: str = "msvcrt.dll") -> Optional[bytes]:
+    """Return an environment variable as a given C runtime sees it.
+
+    Every C runtime keeps its own copy of the environment and the MSYS2
+    libgphoto2 reads the ``msvcrt.dll`` one, so that view decides what the
+    library does; diagnostics compare it with ``ucrtbase.dll``'s copy.
+    """
+    getenv = _crt(runtime).getenv
+    getenv.argtypes = [ctypes.c_char_p]
+    getenv.restype = ctypes.c_char_p
+    return getenv(name.encode("ascii"))
+
+
 def _set_msys2_environment(name: str, value: str) -> None:
-    """Set a process environment variable for the MSYS2 UCRT64 runtime."""
-    global _ucrt_runtime
-    if _ucrt_runtime is None:
-        _ucrt_runtime = ctypes.CDLL("ucrtbase.dll")
-    putenv = _ucrt_runtime._putenv
-    putenv.argtypes = [ctypes.c_char_p]
-    putenv.restype = ctypes.c_int
-    if putenv(os.fsencode(f"{name}={value}")) != 0:
-        raise OSError(f"Could not set {name} for the MSYS2 UCRT64 runtime")
+    """Set a process environment variable for the MSYS2 libgphoto2 runtime.
+
+    Every C runtime keeps its own copy of the environment, and the MSYS2
+    libgphoto2 reads the ``msvcrt.dll`` copy, which is snapshotted when that
+    runtime is loaded. Writing only to ``ucrtbase.dll`` leaves that snapshot
+    untouched: in a frozen application msvcrt is loaded before this code
+    runs, so libgphoto2 keeps using whatever the process inherited (or its
+    compiled-in defaults) and reports "Error loading a library" on machines
+    without a configured runtime. Update every runtime copy and the OS
+    environment as well.
+    """
+    encoded = _narrow_path(value)
+    for runtime in ("ucrtbase.dll", "msvcrt.dll"):
+        putenv = _crt(runtime)._putenv
+        putenv.argtypes = [ctypes.c_char_p]
+        putenv.restype = ctypes.c_int
+        # _putenv is the narrow (ANSI) API, so the value must go in as
+        # ANSI-safe bytes - see _narrow_path for why os.fsencode is wrong.
+        if putenv(name.encode("ascii") + b"=" + encoded) != 0:
+            raise OSError(f"Could not set {name} for the {runtime} runtime")
+    os.environ[name] = encoded.decode("mbcs")
 
 
 def _load_libraries() -> Tuple[ctypes.CDLL, ctypes.CDLL]:
@@ -219,8 +307,11 @@ def _load_libraries() -> Tuple[ctypes.CDLL, ctypes.CDLL]:
         # and autodetection silently reports zero cameras. Prepending the bin
         # folder to PATH and preloading the plugin dependencies makes plugin
         # loading independent of how the app was started. The preloaded
-        # handles must stay referenced to keep the DLLs loaded.
-        os.environ["PATH"] = binary_dir + os.pathsep + os.environ.get("PATH", "")
+        # handles must stay referenced to keep the DLLs loaded. The PATH entry
+        # uses the same ANSI-safe form as CAMLIBS/IOLIBS, so narrow-based
+        # searches by the plugin loader see a path they can open.
+        search_dir = _narrow_path(binary_dir).decode("mbcs")
+        os.environ["PATH"] = search_dir + os.pathsep + os.environ.get("PATH", "")
         for dependency in (
             "libusb-1.0.dll",
             "libgcc_s_seh-1.dll",
@@ -359,7 +450,74 @@ class LibGPhotoCamera:
     def _error(self, result: int, operation: str) -> RuntimeError:
         """Create a readable exception for a negative libgphoto2 result."""
         detail = _decode(self.gp.gp_result_as_string(result)) or f"error {result}"
+        if result == GP_ERROR_LIBRARY:
+            detail += ". " + self._plugin_diagnostics()
         return RuntimeError(f"{operation}: {detail}")
+
+    def _plugin_diagnostics(self) -> str:
+        """Explain a GP_ERROR_LIBRARY result with what the plugin loader saw.
+
+        "Error loading a library" alone cannot distinguish its causes: the
+        runtime resolving to the wrong root, plugin DLLs missing from their
+        folder, present but refused by the OS (antivirus), or listing fine
+        but failing to load again during detection. Probing the same inputs
+        libgphoto2 uses turns a support round trip into an answer.
+        """
+        details = []
+        try:
+            binary_dir, camlibs, iolibs = _runtime_paths()
+        except OSError as error:
+            return f"{error}"
+        details.append(f"runtime bin: {binary_dir}")
+        for name in ("CAMLIBS", "IOLIBS"):
+            value = _getenv(name)
+            if value is None:
+                details.append(f"{name} is not set")
+                continue
+            decoded = value.decode("mbcs", errors="replace")
+            state = "exists" if os.path.isdir(decoded) else "MISSING"
+            detail = f"{name}: {decoded} ({state})"
+            other = _getenv(name, "ucrtbase.dll")
+            if other != value:
+                detail += f"; ucrtbase.dll sees {other!r}"
+            details.append(detail)
+        for label, directory in (("camlibs", camlibs), ("iolibs", iolibs)):
+            dlls = sorted(glob.glob(os.path.join(directory, "*.dll")))
+            broken = []
+            for dll in dlls:
+                try:
+                    ctypes.CDLL(dll)
+                except OSError as error:
+                    broken.append(f"{os.path.basename(dll)}: {error}")
+            if not dlls:
+                state = "no plugin DLLs found"
+            elif broken:
+                state = "not loadable: " + "; ".join(broken)
+            else:
+                state = "all load"
+            details.append(f"{label}: {len(dlls)} plugin DLL(s) in {directory}: {state}")
+        # Ask libgphoto2 itself whether it can see any port drivers: a zero
+        # count means the plugins were never found; a healthy count with this
+        # error means one failed to load again while detection was running.
+        port_list = ctypes.c_void_p()
+        result = self.portlib.gp_port_info_list_new(ctypes.byref(port_list))
+        if result >= 0:
+            result = self.portlib.gp_port_info_list_load(port_list)
+            if result < 0:
+                details.append(
+                    "libgphoto2 port driver scan failed ("
+                    + _decode(self.gp.gp_result_as_string(result)) + ")"
+                )
+            else:
+                count = self.portlib.gp_port_info_list_count(port_list)
+                details.append(f"libgphoto2 port driver scan: {count} driver(s) seen")
+            self.portlib.gp_port_info_list_free(port_list)
+        return (
+            "; ".join(details)
+            + ". Antivirus software can refuse these unsigned DLLs; move "
+            "OpenNumismat to a simple path such as C:\\OpenNumismat and check "
+            "that the libgphoto2 folder sits next to OpenNumismat.exe."
+        )
 
     def cameras(self) -> List[Dict[str, str]]:
         """Enumerate currently connected cameras as model/port records."""
